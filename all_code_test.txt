@@ -1,0 +1,1665 @@
+﻿
+==== Bus.cpp ====
+/**
+ * @file Bus.cpp
+ * @brief Simple system bus for memory and UART devices.
+ */
+
+#include "Bus.h"
+#include "Timer.h"
+
+#include <stdexcept>
+#include <string>
+
+namespace loongarch
+{
+
+Bus::Bus(Memory& memory, Uart& uart, Timer& timer) noexcept
+    : m_memory{memory}
+    , m_uart{uart}
+    , m_timer{timer}
+{
+}
+
+std::uint32_t Bus::read32(std::uint32_t addr)
+{
+    // Route Timer MMIO range.
+    if (addr >= Timer::PhysicalBase &&
+        addr < (Timer::PhysicalBase + Timer::RangeSizeBytes)) {
+        const std::uint32_t offset = addr - Timer::PhysicalBase;
+        return m_timer.read32(offset);
+    }
+
+    // Route UART MMIO range.
+    if (addr >= Uart::PhysicalBase &&
+        addr < (Uart::PhysicalBase + Uart::RangeSizeBytes)) {
+        const std::uint32_t offset = addr - Uart::PhysicalBase;
+        return m_uart.read32(offset);
+    }
+
+    // Route to main memory if within range.
+    if (addr < m_memory.size()) {
+        return m_memory.read32(addr);
+    }
+
+    throw std::runtime_error(
+        "Bus: unmapped read32 at address 0x" +
+        std::to_string(static_cast<unsigned long long>(addr)));
+}
+
+void Bus::write32(std::uint32_t addr, std::uint32_t value)
+{
+    // Route Timer MMIO range.
+    if (addr >= Timer::PhysicalBase &&
+        addr < (Timer::PhysicalBase + Timer::RangeSizeBytes)) {
+        const std::uint32_t offset = addr - Timer::PhysicalBase;
+        m_timer.write32(offset, value);
+        return;
+    }
+
+    // Route UART MMIO range.
+    if (addr >= Uart::PhysicalBase &&
+        addr < (Uart::PhysicalBase + Uart::RangeSizeBytes)) {
+        const std::uint32_t offset = addr - Uart::PhysicalBase;
+        m_uart.write32(offset, value);
+        return;
+    }
+
+    // Route to main memory if within range.
+    if (addr < m_memory.size()) {
+        m_memory.write32(addr, value);
+        return;
+    }
+
+    throw std::runtime_error(
+        "Bus: unmapped write32 at address 0x" +
+        std::to_string(static_cast<unsigned long long>(addr)));
+}
+
+} // namespace loongarch
+
+
+
+==== CPU.cpp ====
+/**
+ * @file CPU.cpp
+ * @brief Basic LoongArch CPU core skeleton implementation.
+ */
+
+#include "CPU.h"
+#include "decoder.h"
+#include <stdexcept>
+namespace loongarch
+{
+
+namespace
+{
+
+// Exception codes (sample values, adjust per ISA)
+constexpr std::uint32_t EXC_ILLEGAL_INSTR = 1u;
+constexpr std::uint32_t EXC_ADDR_ERROR    = 2u;
+constexpr std::uint32_t EXC_SYSCALL       = 3u;
+
+// Hardware interrupt code (MSB=1 means interrupt, not sync exception)
+constexpr std::uint32_t EXC_TIMER_INT     = 0x80u;
+
+// Helper: safe GPR read
+inline std::uint32_t get_reg(const std::uint32_t (&regs)[32],
+                             std::uint32_t        idx) noexcept
+{
+    return (idx < 32u) ? regs[idx] : 0u;
+}
+
+// Helper: safe GPR write (x0 enforced by enforceInvariants)
+inline void set_reg(std::uint32_t (&regs)[32],
+                    std::uint32_t idx,
+                    std::uint32_t value) noexcept
+{
+    if (idx < 32u) {
+        regs[idx] = value;
+    }
+}
+
+} // namespace
+
+CPU::CPU(Device& bus) noexcept
+    : m_bus{bus}
+{
+    // All registers are value-initialized to 0 by the in-class initializer.
+    m_pc = 0U;
+    enforceInvariants();
+}
+
+Device& CPU::bus() noexcept
+{
+    return m_bus;
+}
+
+const Device& CPU::bus() const noexcept
+{
+    return m_bus;
+}
+
+std::uint32_t CPU::getPC() const noexcept
+{
+    return m_pc;
+}
+
+void CPU::setPC(std::uint32_t newPc) noexcept
+{
+    m_pc = newPc;
+}
+
+const std::uint32_t* CPU::registers() const noexcept
+{
+    return m_regs;
+}
+
+void CPU::step()
+{
+    // ============================
+    // Interrupt check (before fetch)
+    // ============================
+    // If an external interrupt is pending and CRMD IE bit allows,
+    // skip current instruction and jump to interrupt handler entry.
+    if (m_interrupt_pending && (m_crmd & 0x1u)) {
+        m_interrupt_pending = false;
+        raise_exception(m_interrupt_code);
+        enforceInvariants();
+        return;
+    }
+
+    const std::uint32_t curr_pc = m_pc;
+
+    // ============================
+    // Fetch
+    // ============================
+    //
+    // Fetch a 32-bit instruction from memory at the current PC.
+    // Bus exceptions are caught and converted to architectural exceptions.
+    std::uint32_t instr = 0u;
+    try {
+        const std::uint32_t fetch_paddr = translate_address(curr_pc, AccessType::FETCH);
+        instr = m_bus.read32(fetch_paddr);
+    } catch (const std::runtime_error& /*unused*/) {
+        m_pc = curr_pc; // On exception, PC points to faulting instruction
+        raise_exception(EXC_ADDR_ERROR);
+        enforceInvariants();
+        return;
+    }
+
+    // Increment PC to point to the next instruction. For a simple
+    // sequential flow, this is PC + 4. Branch/jump instructions in
+    // the Execute stage may override this value.
+    m_pc = curr_pc + 4U;
+
+    // ============================
+    // Decode
+    // ============================
+    // Decode register fields
+    const std::uint32_t rd = decode_rd(instr);
+    const std::uint32_t rj = decode_rj(instr);
+    const std::uint32_t rk = decode_rk(instr);
+
+    // Various opcode views
+    const std::uint32_t opc6  = decode_opcode6(instr);
+    const std::uint32_t opc12 = decode_opcode_2ri12(instr);
+    const std::uint32_t opc3  = decode_opcode_3r(instr);
+
+    // Full-word encoding: SYSCALL / ERTN (only SYSCALL implemented)
+    // SYSCALL: upper 17 bits fixed 0x002B0, lower 15 bits are imm
+    if ( (instr & 0xFFFF8000u) == 0x002B0000u ) {
+        // Trigger syscall exception
+        m_pc = curr_pc + 4U;
+        raise_exception(EXC_SYSCALL);
+        enforceInvariants();
+        return;
+    }
+
+    // ============================
+    // Execute
+    // ============================
+
+    try {
+
+    // 3R instructions: ADD.W / SUB.W / AND / OR / NOR / XOR / SLT / SLTU / SLL.W / SRL.W / SRA.W
+    if (opc3 == OPC3_ADD_W  || opc3 == OPC3_SUB_W ||
+        opc3 == OPC3_AND    || opc3 == OPC3_OR    ||
+        opc3 == OPC3_XOR    || opc3 == OPC3_NOR   ||
+        opc3 == OPC3_SLT    || opc3 == OPC3_SLTU  ||
+        opc3 == OPC3_SLL_W  || opc3 == OPC3_SRL_W ||
+        opc3 == OPC3_SRA_W) {
+
+        const std::uint32_t lhs = get_reg(m_regs, rj);
+        const std::uint32_t rhs = get_reg(m_regs, rk);
+
+        std::uint32_t result = 0u;
+        switch (opc3) {
+        case OPC3_ADD_W:
+            // add.w rd, rj, rk
+            result = lhs + rhs;
+            break;
+        case OPC3_SUB_W:
+            // sub.w rd, rj, rk
+            result = lhs - rhs;
+            break;
+        case OPC3_AND:
+            // and rd, rj, rk
+            result = lhs & rhs;
+            break;
+        case OPC3_OR:
+            // or rd, rj, rk
+            result = lhs | rhs;
+            break;
+        case OPC3_XOR:
+            // xor rd, rj, rk
+            result = lhs ^ rhs;
+            break;
+        case OPC3_NOR:
+            // nor rd, rj, rk  (bitwise NOR)
+            result = ~(lhs | rhs);
+            break;
+        case OPC3_SLT: {
+            // slt rd, rj, rk  (signed compare)
+            const std::int32_t sl = static_cast<std::int32_t>(lhs);
+            const std::int32_t sr = static_cast<std::int32_t>(rhs);
+            result = (sl < sr) ? 1u : 0u;
+            break;
+        }
+        case OPC3_SLTU:
+            // sltu rd, rj, rk  (unsigned compare)
+            result = (lhs < rhs) ? 1u : 0u;
+            break;
+        case OPC3_SLL_W:
+            // sll.w rd, rj, rk  (logical left shift, amount = rk[4:0])
+            result = lhs << (rhs & 0x1Fu);
+            break;
+        case OPC3_SRL_W:
+            // srl.w rd, rj, rk  (logical right shift)
+            result = static_cast<std::uint32_t>(
+                static_cast<std::uint32_t>(lhs) >> (rhs & 0x1Fu));
+            break;
+        case OPC3_SRA_W:
+            // sra.w rd, rj, rk  (arithmetic right shift)
+            result = static_cast<std::uint32_t>(
+                static_cast<std::int32_t>(lhs) >> (rhs & 0x1Fu));
+            break;
+        default:
+            break;
+        }
+
+        set_reg(m_regs, rd, result);
+    }
+    // Shift-immediate: SLLI.W / SRLI.W / SRAI.W
+    else if (opc3 == OPC3_SLLI_W ||
+             opc3 == OPC3_SRLI_W ||
+             opc3 == OPC3_SRAI_W) {
+        const std::uint32_t src   = get_reg(m_regs, rj);
+        const std::uint32_t shamt =
+            static_cast<std::uint32_t>(decode_imm12(instr)) & 0x1Fu; // ui5
+
+        std::uint32_t result = 0u;
+        switch (opc3) {
+        case OPC3_SLLI_W:
+            // slli.w rd, rj, ui5
+            result = src << shamt;
+            break;
+        case OPC3_SRLI_W:
+            // srli.w rd, rj, ui5  (logical right shift)
+            result = static_cast<std::uint32_t>(
+                static_cast<std::uint32_t>(src) >> shamt);
+            break;
+        case OPC3_SRAI_W:
+            // srai.w rd, rj, ui5  (arithmetic right shift)
+            result = static_cast<std::uint32_t>(
+                static_cast<std::int32_t>(src) >> shamt);
+            break;
+        default:
+            break;
+        }
+
+        set_reg(m_regs, rd, result);
+    }
+    // 2RI12: ADDI.W / logical-imm / compare-imm / loads-stores
+    else if (opc12 == OPC2_ADDI_W ||
+             opc12 == OPC2_ANDI   ||
+             opc12 == OPC2_ORI    ||
+             opc12 == OPC2_XORI   ||
+             opc12 == OPC2_SLTI   ||
+             opc12 == OPC2_SLTUI  ||
+             opc12 == OPC2_LD_B   ||
+             opc12 == OPC2_LD_H   ||
+             opc12 == OPC2_LD_W   ||
+             opc12 == OPC2_LD_BU  ||
+             opc12 == OPC2_LD_HU  ||
+             opc12 == OPC2_ST_B   ||
+             opc12 == OPC2_ST_H   ||
+             opc12 == OPC2_ST_W) {
+
+        const std::uint32_t base = get_reg(m_regs, rj);
+        const std::int32_t  simm = decode_imm12(instr);      // sign-extended immediate
+        const std::uint32_t uimm = decode_uimm12(instr);     // zero-extended immediate
+
+        switch (opc12) {
+        case OPC2_ADDI_W: {
+            // addi.w rd, rj, si12
+            const std::int32_t sum =
+                static_cast<std::int32_t>(base) + simm;
+            set_reg(m_regs, rd, static_cast<std::uint32_t>(sum));
+            break;
+        }
+        case OPC2_ANDI:
+            // andi rd, rj, ui12  (zero-extended)
+            set_reg(m_regs, rd, base & uimm);
+            break;
+        case OPC2_ORI:
+            // ori rd, rj, ui12
+            set_reg(m_regs, rd, base | uimm);
+            break;
+        case OPC2_XORI:
+            // xori rd, rj, ui12
+            set_reg(m_regs, rd, base ^ uimm);
+            break;
+        case OPC2_SLTI: {
+            // slti rd, rj, si12  (signed compare)
+            const std::int32_t sl = static_cast<std::int32_t>(base);
+            const std::int32_t sr = simm;
+            set_reg(m_regs, rd, (sl < sr) ? 1u : 0u);
+            break;
+        }
+        case OPC2_SLTUI: {
+            // sltui rd, rj, si12  (unsigned compare, imm sign-extended then unsigned)
+            const std::uint32_t ul =
+                static_cast<std::uint32_t>(base);
+            const std::uint32_t ur =
+                static_cast<std::uint32_t>(simm);
+            set_reg(m_regs, rd, (ul < ur) ? 1u : 0u);
+            break;
+        }
+        case OPC2_LD_B:
+        case OPC2_LD_H:
+        case OPC2_LD_W:
+        case OPC2_LD_BU:
+        case OPC2_LD_HU: {
+            // Load: vaddr = rj + sign_ext(si12)
+            const std::uint32_t addr =
+                static_cast<std::uint32_t>(
+                    static_cast<std::int32_t>(base) + simm);
+            const std::uint32_t paddr = translate_address(addr, AccessType::LOAD);
+
+            if (opc12 == OPC2_LD_W) {
+                const std::uint32_t value = m_bus.read32(paddr);
+                set_reg(m_regs, rd, value);
+            } else {
+                // Use aligned 32-bit access, extract byte/halfword
+                const std::uint32_t aligned =
+                    paddr & ~0x3u;
+                const std::uint32_t word =
+                    m_bus.read32(aligned);
+                const std::uint32_t byteIndex =
+                    paddr & 0x3u;
+
+                if (opc12 == OPC2_LD_B ||
+                    opc12 == OPC2_LD_BU) {
+                    const std::uint8_t b =
+                        static_cast<std::uint8_t>(
+                            (word >> (byteIndex * 8u)) & 0xFFu);
+                    if (opc12 == OPC2_LD_B) {
+                        const std::int8_t sb =
+                            static_cast<std::int8_t>(b);
+                        set_reg(m_regs, rd,
+                                static_cast<std::uint32_t>(sb));
+                    } else {
+                        set_reg(m_regs, rd,
+                                static_cast<std::uint32_t>(b));
+                    }
+                } else { // halfword
+                    // halfword addr 2-byte aligned; simplified
+                    const std::uint32_t halfIndex =
+                        (addr & 0x2u) >> 1u; // 0 or 1
+                    const std::uint16_t h =
+                        static_cast<std::uint16_t>(
+                            (word >> (halfIndex * 16u)) & 0xFFFFu);
+                    if (opc12 == OPC2_LD_H) {
+                        const std::int16_t sh =
+                            static_cast<std::int16_t>(h);
+                        set_reg(m_regs, rd,
+                                static_cast<std::uint32_t>(sh));
+                    } else {
+                        set_reg(m_regs, rd,
+                                static_cast<std::uint32_t>(h));
+                    }
+                }
+            }
+            break;
+        }
+        case OPC2_ST_B:
+        case OPC2_ST_H:
+        case OPC2_ST_W: {
+            // Store: vaddr = rj + sign_ext(si12)
+            const std::uint32_t addr =
+                static_cast<std::uint32_t>(
+                    static_cast<std::int32_t>(base) + simm);
+            const std::uint32_t value = get_reg(m_regs, rd);
+            const std::uint32_t paddr = translate_address(addr, AccessType::STORE);
+
+            if (opc12 == OPC2_ST_W) {
+                m_bus.write32(paddr, value);
+            } else {
+                const std::uint32_t aligned =
+                    paddr & ~0x3u;
+                const std::uint32_t byteIndex =
+                    paddr & 0x3u;
+
+                std::uint32_t word =
+                    m_bus.read32(aligned);
+
+                if (opc12 == OPC2_ST_B) {
+                    const std::uint32_t mask =
+                        ~(0xFFu << (byteIndex * 8u));
+                    const std::uint32_t ins =
+                        (value & 0xFFu) << (byteIndex * 8u);
+                    word = (word & mask) | ins;
+                } else { // ST.H
+                    // Simplified: halfword address must be 2-byte aligned
+                    const std::uint32_t halfIndex =
+                        (addr & 0x2u) >> 1u; // 0 or 1
+                    const std::uint32_t mask =
+                        ~(0xFFFFu << (halfIndex * 16u));
+                    const std::uint32_t ins =
+                        (value & 0xFFFFu) << (halfIndex * 16u);
+                    word = (word & mask) | ins;
+                }
+
+                m_bus.write32(aligned, word);
+            }
+            break;
+        }
+        default:
+            break;
+        }
+    }
+    // 1RI21 upper immediate: LU12I.W rd, si20
+    else if (opc6 == OPC_LU12I_W) {
+        // imm20: assumed [24:5], 20-bit signed, then left-shift 12
+        const std::uint32_t raw20 =
+            extract_bits(instr, 5u, 20u);
+        const std::int32_t si20 =
+            sign_extend<20>(raw20);
+
+        const std::uint32_t value =
+            static_cast<std::uint32_t>(si20) << 12u;
+
+        set_reg(m_regs, rd, value);
+    }
+    // 1RI21 PC-relative: PCADDU12I rd, si20
+    else if (opc6 == OPC_PCADDU12I) {
+        // rd = PC + sign_ext(si20 << 12)
+        const std::uint32_t raw20 =
+            extract_bits(instr, 5u, 20u);
+        const std::uint32_t shifted =
+            (raw20 << 12u) & 0x0FFFF'F000u;
+        const std::int32_t offset =
+            sign_extend<32>(shifted);
+        const std::int32_t pcSigned =
+            static_cast<std::int32_t>(m_pc);
+        const std::int32_t sum =
+            pcSigned + offset;
+        set_reg(m_regs, rd,
+                static_cast<std::uint32_t>(sum));
+    }
+    // 2RI16 branch/jump: BEQ / BNE / BLT / BGE / JIRL / B / BL
+    else if (opc6 == OPC_BEQ ||
+             opc6 == OPC_BNE ||
+             opc6 == OPC_BLT ||
+             opc6 == OPC_BGE ||
+             opc6 == OPC_JIRL ||
+             opc6 == OPC_B   ||
+             opc6 == OPC_BL) {
+
+        const std::uint32_t oldPcPlus4 = m_pc;
+
+        if (opc6 == OPC_BEQ || opc6 == OPC_BNE ||
+            opc6 == OPC_BLT || opc6 == OPC_BGE ||
+            opc6 == OPC_JIRL) {
+
+            const std::uint32_t raw16 =
+                extract_bits(instr, 10u, 16u);
+            // left-shift 2, then sign-extend to 18-bit byte offset
+            const std::int32_t offsetBytes =
+                sign_extend<18>(raw16 << 2u);
+
+            const std::uint32_t lhs = get_reg(m_regs, rj);
+            const std::uint32_t rhs = get_reg(m_regs, rd);
+
+            bool take = false;
+            switch (opc6) {
+            case OPC_BEQ:
+                take = (lhs == rhs);
+                break;
+            case OPC_BNE:
+                take = (lhs != rhs);
+                break;
+            case OPC_BLT: {
+                const std::int32_t sl =
+                    static_cast<std::int32_t>(lhs);
+                const std::int32_t sr =
+                    static_cast<std::int32_t>(rhs);
+                take = (sl < sr);
+                break;
+            }
+            case OPC_BGE: {
+                const std::int32_t sl =
+                    static_cast<std::int32_t>(lhs);
+                const std::int32_t sr =
+                    static_cast<std::int32_t>(rhs);
+                take = (sl >= sr);
+                break;
+            }
+            case OPC_JIRL:
+                take = true;
+                break;
+            default:
+                break;
+            }
+
+            if (take) {
+                if (opc6 == OPC_JIRL) {
+                    // rd = PC + 4
+                    set_reg(m_regs, rd, oldPcPlus4);
+                    const std::uint32_t base =
+                        get_reg(m_regs, rj);
+                    const std::int32_t sum =
+                        static_cast<std::int32_t>(base) +
+                        offsetBytes;
+                    m_pc = static_cast<std::uint32_t>(sum);
+                } else {
+                    const std::int32_t pcSigned =
+                        static_cast<std::int32_t>(m_pc);
+                    const std::int32_t target =
+                        pcSigned + offsetBytes;
+                    m_pc = static_cast<std::uint32_t>(target);
+                }
+            }
+        } else {
+            // B / BL: I26 offset relative to PC
+            const std::uint32_t low10 =
+                extract_bits(instr, 0u, 10u);
+            const std::uint32_t high16 =
+                extract_bits(instr, 10u, 16u);
+            const std::uint32_t raw26 =
+                (high16 << 10u) | low10;
+
+            // left-shift 2 -> 28-bit offset, sign-extend 28
+            const std::uint32_t shifted =
+                raw26 << 2u;
+            const std::int32_t offsetBytes =
+                sign_extend<28>(shifted);
+
+            if (opc6 == OPC_BL) {
+                // r1 = PC + 4
+                set_reg(m_regs, 1u, oldPcPlus4);
+            }
+
+            const std::int32_t pcSigned =
+                static_cast<std::int32_t>(m_pc);
+            const std::int32_t target =
+                pcSigned + offsetBytes;
+            m_pc = static_cast<std::uint32_t>(target);
+        }
+    }
+    else {
+        // Unimplemented instruction: raise illegal instruction exception
+        m_pc = curr_pc + 4U;
+        raise_exception(EXC_ILLEGAL_INSTR);
+    }
+
+    } catch (const std::runtime_error& /*unused*/) {
+        m_pc = curr_pc; // rollback PC to point to faulting load/store
+        raise_exception(EXC_ADDR_ERROR);
+        enforceInvariants();
+        return;
+    }
+
+    // Enforce architectural invariants after executing the instruction.
+    enforceInvariants();
+}
+
+void CPU::enforceInvariants() noexcept
+{
+    // regs[0] is hard-wired to zero in many RISC architectures.
+    // We ensure that no instruction can leave it with a non-zero value.
+    m_regs[0] = 0U;
+}
+
+void CPU::raise_exception(std::uint32_t ex_code) noexcept
+{
+    // Fixed exception handler base; offset by exception code.
+    constexpr std::uint32_t EXC_BASE = 0x1C00'0000u;
+    constexpr std::uint32_t EXC_STRIDE = 0x100u;
+
+    m_epc   = m_pc;      // Save current PC
+    m_estat = ex_code;   // Record exception cause
+
+    // Simple: each exception code jumps to a different entry offset
+    const std::uint32_t offset = ex_code * EXC_STRIDE;
+    m_pc = EXC_BASE + offset;
+
+    // Disable global interrupt on exception entry to prevent nesting
+    m_crmd &= ~0x1u;
+}
+
+void CPU::signalInterrupt(std::uint32_t code) noexcept
+{
+    m_interrupt_pending = true;
+    m_interrupt_code    = code;
+}
+
+std::uint32_t CPU::translate_address(std::uint32_t vaddr, AccessType type)
+{
+    // m_crmd bit 3 is PG (Paging) bit
+    bool pg = (m_crmd & (1u << 3)) != 0;
+    if (!pg) {
+        return vaddr;
+    }
+
+    std::uint32_t pd_idx = (vaddr >> 22) & 0x3FFu;
+    std::uint32_t pt_idx = (vaddr >> 12) & 0x3FFu;
+    std::uint32_t offset = vaddr & 0xFFFu;
+
+    std::uint32_t pde_addr = (m_pgdl & 0xFFFFF000u) + (pd_idx * 4u);
+    std::uint32_t pde = m_bus.read32(pde_addr);
+
+    // Assume bit 0 is Valid bit
+    if ((pde & 0x1u) == 0) {
+        throw std::runtime_error("MMU PDE Invalid");
+    }
+
+    std::uint32_t pt_base = (pde & 0xFFFFF000u);
+    std::uint32_t pte_addr = pt_base + (pt_idx * 4u);
+    std::uint32_t pte = m_bus.read32(pte_addr);
+
+    if ((pte & 0x1u) == 0) {
+        throw std::runtime_error("MMU PTE Invalid");
+    }
+
+    std::uint32_t ppn = (pte & 0xFFFFF000u);
+    return ppn | offset;
+}
+
+} // namespace loongarch
+
+
+==== main.cpp ====
+/**
+ * @file main.cpp
+ * @brief Test harness for LoongArch CPU + MMU Paging.
+ */
+
+#include "Memory.h"
+#include "Uart.h"
+#include "Timer.h"
+#include "Bus.h"
+#include "CPU.h"
+#include "decoder.h"
+
+#include <cstdint>
+#include <cstdio>
+#include <iostream>
+
+using namespace loongarch;
+
+namespace
+{
+
+// Helper to encode 2RI12 format instructions:
+constexpr std::uint32_t encode_2ri12(std::uint32_t opcode10,
+                                     std::uint32_t rd,
+                                     std::uint32_t rj,
+                                     std::int32_t  imm12) noexcept
+{
+    const std::uint32_t uimm = static_cast<std::uint32_t>(imm12) & 0xFFFu;
+    return (opcode10 << 22) |
+           (uimm << 10)     |
+           ((rj & 0x1Fu) << 5) |
+           (rd & 0x1Fu);
+}
+
+} // namespace
+
+void test_mmu()
+{
+    std::printf("=== LoongArch MMU / Paging Test ===\n");
+
+    Memory memory;
+    Uart   uart;
+    Timer  timer;
+    Bus    bus(memory, uart, timer);
+    CPU    cpu(bus);
+
+    // 1. Setup Page Tables
+    // Map Virtual Address 0x12345000 to Physical Address 0x0000A000
+    // VADDR: 0x12345000 -> VPN: 0x12345, Offset: 0x000
+    // PD Index: VPN [19:10] = 0x12345 >> 10 = 0x048
+    // PT Index: VPN [9:0]   = 0x12345 & 0x3FF = 0x345
+
+    const std::uint32_t PD_BASE = 0x00100000u;
+    const std::uint32_t PT_BASE = 0x00200000u;
+    const std::uint32_t PPN     = 0x0000A000u; // Physical address base
+
+    std::printf("[MMU] Creating Page Directory at physical 0x%08X\n", PD_BASE);
+    std::printf("[MMU] Creating Page Table at physical 0x%08X\n", PT_BASE);
+    std::printf("[MMU] Mapping Virtual 0x12345000 -> Physical 0x0000A000\n");
+
+    // Write PDE at PD_BASE + PD_Idx * 4
+    std::uint32_t pde_addr = PD_BASE + (0x048 * 4u);
+    memory.write32(pde_addr, PT_BASE | 0x1u); // Set Valid bit (0x1)
+
+    // Write PTE at PT_BASE + PT_Idx * 4
+    std::uint32_t pte_addr = PT_BASE + (0x345 * 4u);
+    memory.write32(pte_addr, PPN | 0x1u); // Set Valid bit (0x1)
+
+    // 2. Put instructions in mapped physical memory
+    // ADDI.W r1, r0, 42
+    const std::uint32_t instr_addi = encode_2ri12(OPC2_ADDI_W, 1u, 0u, 42);
+    memory.write32(PPN + 0, instr_addi);
+
+    // 3. Configure CPU
+    // Enable PG (bit 3) and set PGDL
+    std::uint32_t crmd = cpu.getCRMD();
+    crmd |= (1u << 3); // Set PG bit
+    cpu.setCRMD(crmd);
+    cpu.setPGDL(PD_BASE);
+    cpu.setPC(0x12345000u);
+
+    std::printf("\n[MMU] Executing mapped instruction at VADDR 0x12345000\n");
+    cpu.step();
+
+    // Check if r1 has 42
+    if (cpu.registers()[1] == 42) {
+        std::printf("[MMU] SUCCESS: Fetched and executed instruction correctly. r1 = %u\n", cpu.registers()[1]);
+    } else {
+        std::printf("[MMU] FAILURE: Expected r1 = 42, got %u\n", cpu.registers()[1]);
+    }
+
+    std::printf("[MMU] PC is now: 0x%08X\n", cpu.getPC());
+
+    // 4. Test Page Fault
+    std::printf("\n[MMU] Testing Page Fault by fetching from unmapped VADDR 0x20000000\n");
+    cpu.setPC(0x20000000u);
+    cpu.step();
+
+    std::printf("[MMU] After page fault, PC is: 0x%08X\n", cpu.getPC());
+    // Should jump to exception handler (0x1C000000 + EXC_ADDR_ERROR (2) * 0x100 = 0x1C000200)
+    if (cpu.getPC() == 0x1C000200u) {
+        std::printf("[MMU] SUCCESS: Page fault correctly routed to exception handler.\n");
+    } else {
+        std::printf("[MMU] FAILURE: Expected PC = 0x1C000200, got 0x%08X\n", cpu.getPC());
+    }
+}
+
+int main()
+{
+    test_mmu();
+    return 0;
+}
+
+
+==== Memory.cpp ====
+/**
+ * @file Memory.cpp
+ * @brief Implementation of the simple physical memory device.
+ */
+
+#include "Memory.h"
+
+#include <stdexcept>
+#include <string>
+
+namespace loongarch
+{
+
+Memory::Memory(std::size_t sizeBytes)
+    : m_data()
+{
+    if (sizeBytes == 0U) {
+        throw std::runtime_error("Memory: sizeBytes must be greater than zero");
+    }
+
+    m_data.resize(sizeBytes, static_cast<std::uint8_t>(0U));
+}
+
+std::size_t Memory::size() const noexcept
+{
+    return m_data.size();
+}
+
+std::uint32_t Memory::read32(std::uint32_t addr)
+{
+    constexpr std::size_t accessSize = sizeof(std::uint32_t);
+    checkAlignedAndInRange(addr, accessSize);
+
+    const auto base = static_cast<std::size_t>(addr);
+
+    std::uint32_t value = 0;
+    value |= static_cast<std::uint32_t>(m_data[base]);
+    value |= static_cast<std::uint32_t>(m_data[base + 1U]) << 8U;
+    value |= static_cast<std::uint32_t>(m_data[base + 2U]) << 16U;
+    value |= static_cast<std::uint32_t>(m_data[base + 3U]) << 24U;
+
+    return value;
+}
+
+void Memory::write32(std::uint32_t addr, std::uint32_t value)
+{
+    constexpr std::size_t accessSize = sizeof(std::uint32_t);
+    checkAlignedAndInRange(addr, accessSize);
+
+    const auto base = static_cast<std::size_t>(addr);
+
+    m_data[base] = static_cast<std::uint8_t>(value & 0xFFU);
+    m_data[base + 1U] = static_cast<std::uint8_t>((value >> 8U) & 0xFFU);
+    m_data[base + 2U] = static_cast<std::uint8_t>((value >> 16U) & 0xFFU);
+    m_data[base + 3U] = static_cast<std::uint8_t>((value >> 24U) & 0xFFU);
+}
+
+void Memory::checkAlignedAndInRange(std::uint32_t addr,
+                                    std::size_t accessSize) const
+{
+    if ((addr & 0x3U) != 0U) {
+        throw std::runtime_error(
+            "Memory: unaligned 32-bit access at address 0x" +
+            std::to_string(static_cast<unsigned long long>(addr)));
+    }
+
+    const auto base = static_cast<std::size_t>(addr);
+    if (accessSize == 0U || base > m_data.size() - accessSize) {
+        throw std::runtime_error(
+            "Memory: out-of-range 32-bit access at address 0x" +
+            std::to_string(static_cast<unsigned long long>(addr)));
+    }
+}
+
+} // namespace loongarch
+
+
+
+==== Timer.cpp ====
+/**
+ * @file Timer.cpp
+ * @brief Memory-mapped timer device implementation.
+ */
+
+#include "Timer.h"
+
+#include <stdexcept>
+#include <string>
+
+namespace loongarch
+{
+
+// 鈹€鈹€ MMIO register offsets 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+namespace
+{
+constexpr std::uint32_t REG_TVAL = 0x00u;   // read-only  : tick count
+constexpr std::uint32_t REG_TCFG = 0x04u;   // read/write : threshold
+constexpr std::uint32_t REG_TCTL = 0x08u;   // read/write : enable (bit 0)
+constexpr std::uint32_t REG_TCLR = 0x0Cu;   // write-only : clear pending
+} // namespace
+
+std::uint32_t Timer::read32(std::uint32_t addr)
+{
+    switch (addr) {
+    case REG_TVAL:
+        return static_cast<std::uint32_t>(m_ticks & 0xFFFF'FFFFu);
+    case REG_TCFG:
+        return m_threshold;
+    case REG_TCTL:
+        return m_enabled ? 1u : 0u;
+    case REG_TCLR:
+        // Write-only register; reading returns 0.
+        return 0u;
+    default:
+        throw std::runtime_error(
+            "Timer: invalid read32 at offset 0x" +
+            std::to_string(static_cast<unsigned long long>(addr)));
+    }
+}
+
+void Timer::write32(std::uint32_t addr, std::uint32_t value)
+{
+    switch (addr) {
+    case REG_TVAL:
+        // TVAL is read-only; writes are silently ignored.
+        break;
+    case REG_TCFG:
+        m_threshold = value;
+        break;
+    case REG_TCTL:
+        m_enabled = (value & 1u) != 0u;
+        break;
+    case REG_TCLR:
+        m_interruptPending = false;
+        break;
+    default:
+        throw std::runtime_error(
+            "Timer: invalid write32 at offset 0x" +
+            std::to_string(static_cast<unsigned long long>(addr)));
+    }
+}
+
+void Timer::tick()
+{
+    if (!m_enabled) {
+        return;
+    }
+
+    ++m_ticks;
+
+    // Fire an interrupt when the tick count is an exact multiple of
+    // the configured threshold (and the threshold is non-zero).
+    if (m_threshold != 0u && (m_ticks % m_threshold) == 0u) {
+        m_interruptPending = true;
+    }
+}
+
+bool Timer::pending() const noexcept
+{
+    return m_interruptPending;
+}
+
+void Timer::clearPending() noexcept
+{
+    m_interruptPending = false;
+}
+
+} // namespace loongarch
+
+
+==== Uart.cpp ====
+/**
+ * @file Uart.cpp
+ * @brief Simple memory-mapped UART device implementation.
+ */
+
+#include "Uart.h"
+
+#include <iostream>
+
+namespace loongarch
+{
+
+std::uint32_t Uart::read32(std::uint32_t /*addr*/)
+{
+    // For now, no readable UART state is modelled; return 0.
+    return 0U;
+}
+
+void Uart::write32(std::uint32_t addr, std::uint32_t value)
+{
+    // We currently only model a single TX register at offset 0.
+    // Writes to other offsets are ignored but could be extended later.
+    if ((addr & 0x3U) == 0U) {
+        const char ch = static_cast<char>(value & 0xFFU);
+        std::cout << ch;
+        std::cout.flush();
+    }
+}
+
+} // namespace loongarch
+
+
+
+==== Bus.h ====
+/**
+ * @file Bus.h
+ * @brief Simple system bus for memory and UART devices.
+ *
+ * The Bus implements the Device interface and routes 32-bit accesses
+ * either to main memory or to the UART MMIO region based on the
+ * physical address.
+ */
+
+#pragma once
+
+#include "Device.h"
+#include "Memory.h"
+#include "Uart.h"
+#include "Timer.h"
+
+#include <cstdint>
+
+namespace loongarch
+{
+
+/**
+ * @brief Minimal system bus implementation.
+ *
+ * Address map:
+ * - [0, memory.size()) is routed to main memory.
+ * - [Uart::PhysicalBase, Uart::PhysicalBase + Uart::RangeSizeBytes)
+ *   is routed to the UART device.
+ *
+ * Any other address currently results in std::runtime_error.
+ */
+class Bus final : public Device
+{
+public:
+    Bus(Memory& memory, Uart& uart, Timer& timer) noexcept;
+    ~Bus() override = default;
+
+    Bus(const Bus&) = delete;
+    Bus& operator=(const Bus&) = delete;
+    Bus(Bus&&) = default;
+    Bus& operator=(Bus&&) = default;
+
+    [[nodiscard]] std::uint32_t read32(std::uint32_t addr) override;
+    void write32(std::uint32_t addr, std::uint32_t value) override;
+
+private:
+    Memory& m_memory;
+    Uart&   m_uart;
+    Timer&  m_timer;
+};
+
+} // namespace loongarch
+
+
+
+==== CPU.h ====
+/**
+ * @file CPU.h
+ * @brief Basic LoongArch CPU core skeleton.
+ *
+ * This header declares a minimal CPU model with 32 general-purpose
+ * registers and a program counter, plus a single-step execution
+ * function using a classic Fetch/Decode/Execute pipeline skeleton.
+ */
+
+#pragma once
+
+#include "Device.h"
+
+#include <cstdint>
+#include <cstddef>
+
+namespace loongarch
+{
+
+// 鏍囧織浣嶆灇涓?enum class AccessType { FETCH, LOAD, STORE };
+
+/**
+ * @brief Minimal LoongArch CPU core.
+ *
+ * This CPU model owns a reference to a @c Device instance (typically a
+ * system bus) and maintains architectural state:
+ * - 32 general-purpose registers (GPRs), each 32 bits wide.
+ * - A 32-bit program counter (PC).
+ *
+ * By convention, @c regs[0] is hard-wired to zero; the implementation
+ * ensures this invariant after each step.
+ */
+class CPU
+{
+public:
+    /**
+     * @brief Construct a CPU core bound to a bus device.
+     *
+     * @param bus The system bus handling instruction and data accesses.
+     *        The caller must ensure the lifetime of @p bus exceeds that
+     *        of the CPU instance.
+     */
+    explicit CPU(Device& bus) noexcept;
+
+    CPU(const CPU&) = delete;
+    CPU& operator=(const CPU&) = delete;
+    CPU(CPU&&) = default;
+    CPU& operator=(CPU&&) = default;
+
+    /// @return Reference to the underlying bus device.
+    [[nodiscard]] Device& bus() noexcept;
+
+    /// @return Const reference to the underlying bus device.
+    [[nodiscard]] const Device& bus() const noexcept;
+
+    /// @return Current program counter value.
+    [[nodiscard]] std::uint32_t getPC() const noexcept;
+
+    /// Set the program counter to a new value.
+    void setPC(std::uint32_t newPc) noexcept;
+
+    /// @return Pointer to the internal GPR array (size 32).
+    [[nodiscard]] const std::uint32_t* registers() const noexcept;
+
+    // Test accessors for CSRs
+    void setCRMD(std::uint32_t value) noexcept { m_crmd = value; }
+    [[nodiscard]] std::uint32_t getCRMD() const noexcept { return m_crmd; }
+
+    void setPGDL(std::uint32_t value) noexcept { m_pgdl = value; }
+    [[nodiscard]] std::uint32_t getPGDL() const noexcept { return m_pgdl; }
+
+    /**
+     * @brief Execute a single instruction.
+     *
+     * This performs a classic three-stage pipeline in a single
+     * function:
+     * - Fetch:  read 32-bit instruction from @c pc and increment @c pc by 4.
+     * - Decode: derive opcode/operands from the raw instruction word.
+     * - Execute: perform the operation, possibly reading/writing memory
+     *   and registers.
+     *
+     * The current implementation only contains a high-level skeleton;
+     * the real instruction semantics should be filled in later.
+     *
+     * @throws std::runtime_error if the fetch causes an invalid memory
+     *         access (propagated from @c Device::read32).
+     */
+    void step();
+
+    /**
+     * @brief Signal an external interrupt to the CPU.
+     *
+     * Sets the internal pending-interrupt flag so that the next
+     * call to step() will service it (if interrupts are enabled
+     * in CRMD).
+     *
+     * @param code  Exception/interrupt code to pass to raise_exception.
+     */
+    void signalInterrupt(std::uint32_t code) noexcept;
+
+private:
+    Device&      m_bus;
+    std::uint32_t m_regs[32]{};
+    std::uint32_t m_pc{0};
+
+    // 绠€鍖栫増鎺у埗鐘舵€佸瘎瀛樺櫒锛圕SR锛?    // EPC   : 鍙戠敓寮傚父鏃剁殑鎸囦护鍦板潃
+    // ESTAT : 寮傚父鍘熷洜鐮佺瓑
+    // CRMD  : 褰撳墠妯″紡/鐘舵€侊紝bit 0 = IE锛堝叏灞€涓柇浣胯兘锛?    // ECFG  : 涓柇浣胯兘閰嶇疆锛堥鐣欙級
+    std::uint32_t m_epc{0};
+    std::uint32_t m_estat{0};
+    std::uint32_t m_crmd{1};   // 榛樿浣胯兘涓柇 (IE=1)
+    std::uint32_t m_ecfg{0xFFFF'FFFFu}; // 榛樿鍏ㄩ儴涓柇婧愪娇鑳?
+    // 澶栭儴涓柇淇″彿
+    bool          m_interrupt_pending{false};
+    std::uint32_t m_interrupt_code{0};
+
+    // 鍐呴儴瀵勫瓨鍣細涓€绾ч〉琛ㄧ墿鐞嗗熀鍦板潃
+    std::uint32_t m_pgdl{0};
+
+    /// Ensure architectural invariants (e.g., regs[0] == 0).
+    void enforceInvariants() noexcept;
+
+    /// 瑙﹀彂鏋舵瀯绾у紓甯革細淇濆瓨 EPC/ESTAT 骞惰烦杞埌寮傚父鍏ュ彛銆?    void raise_exception(std::uint32_t ex_code) noexcept;
+
+    // 杩斿洖杞崲鍚庣殑鐗╃悊鍦板潃銆傚鏋滃彂鐢熺己椤垫垨鏉冮檺閿欒锛屾姏鍑虹壒瀹氱殑寮傚父鎴栬皟鐢?raise_exception銆?    std::uint32_t translate_address(std::uint32_t vaddr, AccessType type);
+};
+
+} // namespace loongarch
+
+
+==== decoder.h ====
+#pragma once
+
+#include <cstdint>
+
+namespace loongarch
+{
+
+// ==========================
+// 閫氱敤浣嶆/绗﹀彿鎵╁睍宸ュ叿
+// ==========================
+
+/// 鎻愬彇 [lsb, lsb + width - 1] 杩欐浣嶅煙锛? 涓烘渶浣庝綅锛?constexpr inline std::uint32_t extract_bits(std::uint32_t value,
+                                            unsigned      lsb,
+                                            unsigned      width) noexcept
+{
+    const std::uint32_t mask = (width == 32u)
+        ? 0xFFFF'FFFFu
+        : ((1u << width) - 1u);
+
+    return (value >> lsb) & mask;
+}
+
+/// 灏嗗搴︿负 Bits 鐨勬棤绗﹀彿鍊煎仛 32 浣嶆湁绗﹀彿鎵╁睍
+template <unsigned Bits>
+constexpr inline std::int32_t sign_extend(std::uint32_t value) noexcept
+{
+    static_assert(Bits > 0 && Bits <= 32, "Bits must be in (0, 32]");
+
+    const std::uint32_t mask = (Bits == 32u)
+        ? 0xFFFF'FFFFu
+        : ((1u << Bits) - 1u);
+
+    value &= mask;
+
+    if constexpr (Bits == 32u) {
+        return static_cast<std::int32_t>(value);
+    } else {
+        const std::uint32_t sign_bit = 1u << (Bits - 1u);
+        if (value & sign_bit) {
+            // 璐熸暟锛氳ˉ榻愰珮浣?1
+            value |= (~mask);
+        }
+        return static_cast<std::int32_t>(value);
+    }
+}
+
+// ==========================
+// LoongArch 鎸囦护瀛楁鎻愬彇
+// 锛堟寜浣犵粰瀹氱殑 bit 缂栧彿锛?// ==========================
+
+/// 閫氱敤 6 浣?opcode锛堜富瑕佺敤浜?2RI16 / 1RI21锛?constexpr inline std::uint32_t decode_opcode6(std::uint32_t instr) noexcept
+{
+    return extract_bits(instr, 26u, 6u);
+}
+
+/// 2RI12 鎸囦护鐨?10 浣?opcode锛坆it 31-22锛?constexpr inline std::uint32_t decode_opcode_2ri12(std::uint32_t instr) noexcept
+{
+    return extract_bits(instr, 22u, 10u);
+}
+
+/// 3R 鎸囦护鐨?17 浣?opcode锛坆it 31-15锛?constexpr inline std::uint32_t decode_opcode_3r(std::uint32_t instr) noexcept
+{
+    return extract_bits(instr, 15u, 17u);
+}
+
+/// rd: 鐩爣瀵勫瓨鍣紝bit 4:0
+constexpr inline std::uint32_t decode_rd(std::uint32_t instr) noexcept
+{
+    return extract_bits(instr, 0u, 5u);
+}
+
+/// rj: 婧愬瘎瀛樺櫒 1锛宐it 9:5
+constexpr inline std::uint32_t decode_rj(std::uint32_t instr) noexcept
+{
+    return extract_bits(instr, 5u, 5u);
+}
+
+/// rk: 婧愬瘎瀛樺櫒 2锛宐it 14:10
+constexpr inline std::uint32_t decode_rk(std::uint32_t instr) noexcept
+{
+    return extract_bits(instr, 10u, 5u);
+}
+
+/// ra: bit 19:15
+constexpr inline std::uint32_t decode_ra(std::uint32_t instr) noexcept
+{
+    return extract_bits(instr, 15u, 5u);
+}
+
+// ==========================
+// 鍚勭鏍煎紡鐨勬湁绗﹀彿绔嬪嵆鏁?// ==========================
+
+/// imm12: 12 浣嶆棤绗﹀彿绔嬪嵆鏁帮紝浣嶄簬 bit 21:10锛堢敤浜?ANDI/ORI/XORI 绛夐浂鎵╁睍锛?constexpr inline std::uint32_t decode_uimm12(std::uint32_t instr) noexcept
+{
+    return extract_bits(instr, 10u, 12u);
+}
+
+/// imm8:  8 浣嶆湁绗﹀彿绔嬪嵆鏁帮紝浣嶄簬 bit 17:10锛?RI8锛?constexpr inline std::int32_t decode_imm8(std::uint32_t instr) noexcept
+{
+    const std::uint32_t raw = extract_bits(instr, 10u, 8u);
+    return sign_extend<8>(raw);
+}
+
+/// imm12: 12 浣嶆湁绗﹀彿绔嬪嵆鏁帮紝浣嶄簬 bit 21:10锛?RI12锛?constexpr inline std::int32_t decode_imm12(std::uint32_t instr) noexcept
+{
+    const std::uint32_t raw = extract_bits(instr, 10u, 12u);
+    return sign_extend<12>(raw);
+}
+
+/// imm14: 14 浣嶆湁绗﹀彿绔嬪嵆鏁帮紝浣嶄簬 bit 23:10锛?RI14锛?constexpr inline std::int32_t decode_imm14(std::uint32_t instr) noexcept
+{
+    const std::uint32_t raw = extract_bits(instr, 10u, 14u);
+    return sign_extend<14>(raw);
+}
+
+/// imm16: 16 浣嶆湁绗﹀彿绔嬪嵆鏁帮紝浣嶄簬 bit 25:10锛?RI16锛?constexpr inline std::int32_t decode_imm16(std::uint32_t instr) noexcept
+{
+    const std::uint32_t raw = extract_bits(instr, 10u, 16u);
+    return sign_extend<16>(raw);
+}
+
+/// imm21: 21 浣嶆湁绗﹀彿绔嬪嵆鏁帮紝鏍煎紡 {inst[9:0], inst[25:10]}锛?RI21锛?/// 瀹為檯浣跨敤鏃堕€氬父杩橀渶宸︾Щ 2 浣嶏紙涔樹互 4 瀛楄妭锛夈€?constexpr inline std::int32_t decode_imm21(std::uint32_t instr) noexcept
+{
+    const std::uint32_t low10  = extract_bits(instr, 0u, 10u);
+    const std::uint32_t high16 = extract_bits(instr, 10u, 16u);
+    const std::uint32_t concat = (high16 << 10u) | low10;
+    const std::uint32_t raw    = concat & ((1u << 21u) - 1u);
+    return sign_extend<21>(raw);
+}
+
+/// imm26: 26 浣嶆湁绗﹀彿绔嬪嵆鏁帮紝鏍煎紡 {inst[9:0], inst[25:10]}锛圛26锛?/// 瀹為檯浣跨敤鏃跺悓鏍烽€氬父闇€瑕佸乏绉?2 浣嶏紙涔樹互 4 瀛楄妭锛夈€?constexpr inline std::int32_t decode_imm26(std::uint32_t instr) noexcept
+{
+    const std::uint32_t low10  = extract_bits(instr, 0u, 10u);
+    const std::uint32_t high16 = extract_bits(instr, 10u, 16u);
+    const std::uint32_t concat = (high16 << 10u) | low10;
+    const std::uint32_t raw    = concat & ((1u << 26u) - 1u);
+    return sign_extend<26>(raw);
+}
+
+// ==========================
+// 鎸囦护 opcode 甯搁噺鏄犲皠
+// ==========================
+
+// [Type: 2RI16] - Opcode [31:26]
+constexpr std::uint32_t OPC_JIRL = 0x13u;
+constexpr std::uint32_t OPC_B    = 0x14u;
+constexpr std::uint32_t OPC_BL   = 0x15u;
+constexpr std::uint32_t OPC_BEQ  = 0x16u;
+constexpr std::uint32_t OPC_BNE  = 0x17u;
+constexpr std::uint32_t OPC_BLT  = 0x18u;
+constexpr std::uint32_t OPC_BGE  = 0x19u;
+constexpr std::uint32_t OPC_BLTU = 0x1Au;
+constexpr std::uint32_t OPC_BGEU = 0x1Bu;
+
+// [Type: 1RI21] - Opcode [31:26]
+constexpr std::uint32_t OPC_LU12I_W = 0x05u;
+constexpr std::uint32_t OPC_PCADDI  = 0x06u;
+
+// [Type: 2RI12] - Opcode [31:22]
+constexpr std::uint32_t OPC2_ADDI_W = 0x00Au;
+constexpr std::uint32_t OPC2_ANDI   = 0x00Du;
+constexpr std::uint32_t OPC2_ORI    = 0x00Eu;
+constexpr std::uint32_t OPC2_XORI   = 0x00Fu;
+constexpr std::uint32_t OPC2_SLTI   = 0x008u;
+constexpr std::uint32_t OPC2_SLTUI  = 0x009u;
+constexpr std::uint32_t OPC2_LD_B   = 0x0A0u;
+constexpr std::uint32_t OPC2_LD_H   = 0x0A1u;
+constexpr std::uint32_t OPC2_LD_W   = 0x0A2u;
+constexpr std::uint32_t OPC2_ST_B   = 0x0A4u;
+constexpr std::uint32_t OPC2_ST_H   = 0x0A5u;
+constexpr std::uint32_t OPC2_ST_W   = 0x0A6u;
+constexpr std::uint32_t OPC2_LD_BU  = 0x0A8u;
+constexpr std::uint32_t OPC2_LD_HU  = 0x0A9u;
+
+// [Type: 3R] - Opcode [31:15]
+constexpr std::uint32_t OPC3_ADD_W = 0x00020u;
+constexpr std::uint32_t OPC3_SUB_W = 0x00022u;
+constexpr std::uint32_t OPC3_SLL_W = 0x0002Eu;
+constexpr std::uint32_t OPC3_SRL_W = 0x0002Fu;
+constexpr std::uint32_t OPC3_SRA_W = 0x00030u;
+constexpr std::uint32_t OPC3_AND   = 0x00029u;
+constexpr std::uint32_t OPC3_OR    = 0x0002Au;
+constexpr std::uint32_t OPC3_XOR   = 0x0002Bu;
+constexpr std::uint32_t OPC3_SLT   = 0x00024u;
+constexpr std::uint32_t OPC3_SLTU  = 0x00025u;
+
+// Supplementary 3R / shift-immediate style opcodes [31:15]
+constexpr std::uint32_t OPC3_SLLI_W = 0x00001u;
+constexpr std::uint32_t OPC3_SRLI_W = 0x00004u;
+constexpr std::uint32_t OPC3_SRAI_W = 0x00008u;
+
+// NOR opcode (鎸変綅鎴栭潪)锛屼娇鐢ㄥ崟鐙?3R 缂栫爜
+constexpr std::uint32_t OPC3_NOR   = 0x00028u;
+
+// PC 鐩稿瀵诲潃绫伙紙PCADDU12I锛夛紝Opcode [31:26] = 0x0E
+constexpr std::uint32_t OPC_PCADDU12I = 0x0Eu;
+
+} // namespace loongarch
+
+
+==== Device.h ====
+/**
+ * @file Device.h
+ * @brief Abstract base class for LoongArch simulator devices.
+ *
+ * This header defines the common 32-bit memory-mapped access interface
+ * for all devices attached to the simulated bus.
+ */
+
+#pragma once
+
+#include <cstdint>
+
+namespace loongarch
+{
+
+/**
+ * @brief Abstract base class for all memory-mapped devices.
+ *
+ * A device exposes a 32-bit read/write interface using guest physical
+ * addresses (offsets) in the device's own address space.
+ *
+ * Implementations must be safe for the access patterns of the simulator
+ * (alignment, bounds, etc.) and are expected to signal invalid accesses
+ * via exceptions.
+ */
+class Device
+{
+public:
+    Device() = default;
+    virtual ~Device() = default;
+
+    Device(const Device&) = delete;
+    Device& operator=(const Device&) = delete;
+    Device(Device&&) = default;
+    Device& operator=(Device&&) = default;
+
+    /**
+     * @brief Read a 32-bit little-endian value from the device.
+     *
+     * @param addr 32-bit byte address within the device's address space.
+     * @return The 32-bit value read.
+     *
+     * @throws std::runtime_error Implementations may throw on invalid
+     *         accesses (misalignment, out-of-range, etc.).
+     */
+    [[nodiscard]] virtual std::uint32_t read32(std::uint32_t addr) = 0;
+
+    /**
+     * @brief Write a 32-bit little-endian value to the device.
+     *
+     * @param addr 32-bit byte address within the device's address space.
+     * @param value The 32-bit value to write.
+     *
+     * @throws std::runtime_error Implementations may throw on invalid
+     *         accesses (misalignment, out-of-range, etc.).
+     */
+    virtual void write32(std::uint32_t addr, std::uint32_t value) = 0;
+};
+
+} // namespace loongarch
+
+
+
+==== Memory.h ====
+/**
+ * @file Memory.h
+ * @brief Simple physical memory device implementation.
+ *
+ * This header declares a memory-mapped RAM device backed by a
+ * contiguous byte buffer. It is intended to be used as the main
+ * physical memory for the LoongArch simulator.
+ */
+
+#pragma once
+
+#include "Device.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+
+namespace loongarch
+{
+
+/**
+ * @brief Simple byte-addressable physical memory device.
+ *
+ * The memory is backed by a @c std::vector<uint8_t> and supports
+ * 32-bit little-endian aligned accesses.
+ *
+ * - Default size is 16 MiB, configurable at construction.
+ * - 32-bit accesses must be 4-byte aligned; misaligned or out-of-range
+ *   accesses will throw @c std::runtime_error.
+ */
+class Memory final : public Device
+{
+public:
+    /// Default memory size in bytes (16 MiB).
+    static constexpr std::size_t DefaultSizeBytes =
+        static_cast<std::size_t>(16u) * 1024u * 1024u;
+
+    /**
+     * @brief Construct a memory device.
+     *
+     * @param sizeBytes Total size of the memory in bytes. Defaults to
+     *        16 MiB. The size may be any positive value; callers are
+     *        responsible for using addresses within this range.
+     *
+     * @throws std::runtime_error if sizeBytes is zero.
+     */
+    explicit Memory(std::size_t sizeBytes = DefaultSizeBytes);
+
+    Memory(const Memory&) = delete;
+    Memory& operator=(const Memory&) = delete;
+    Memory(Memory&&) = default;
+    Memory& operator=(Memory&&) = default;
+
+    /// @return Size of the memory in bytes.
+    [[nodiscard]] std::size_t size() const noexcept;
+
+    /// @copydoc Device::read32
+    [[nodiscard]] std::uint32_t read32(std::uint32_t addr) override;
+
+    /// @copydoc Device::write32
+    void write32(std::uint32_t addr, std::uint32_t value) override;
+
+private:
+    std::vector<std::uint8_t> m_data;
+
+    /// Validate that a 32-bit access is aligned and within range.
+    void checkAlignedAndInRange(std::uint32_t addr,
+                                std::size_t accessSize) const;
+};
+
+} // namespace loongarch
+
+
+
+==== Timer.h ====
+/**
+ * @file Timer.h
+ * @brief Memory-mapped timer device with interrupt generation.
+ *
+ * The Timer counts ticks driven by the main simulation loop.
+ * When the tick count reaches a configurable threshold, it raises
+ * a pending interrupt that the CPU can poll and acknowledge.
+ *
+ * MMIO register map (16 bytes, base = Timer::PhysicalBase):
+ *   Offset 0x00 鈥?TVAL (read-only)  : current tick count (low 32 bits)
+ *   Offset 0x04 鈥?TCFG (read/write) : interrupt threshold (fire every N ticks)
+ *   Offset 0x08 鈥?TCTL (read/write) : bit 0 = timer enable
+ *   Offset 0x0C 鈥?TCLR (write-only) : write any value to clear pending IRQ
+ */
+
+#pragma once
+
+#include "Device.h"
+
+#include <cstdint>
+
+namespace loongarch
+{
+
+class Timer final : public Device
+{
+public:
+    Timer() = default;
+    ~Timer() override = default;
+
+    Timer(const Timer&) = delete;
+    Timer& operator=(const Timer&) = delete;
+    Timer(Timer&&) = default;
+    Timer& operator=(Timer&&) = default;
+
+    /// Fixed physical base address in the system MMIO map.
+    static constexpr std::uint32_t PhysicalBase   = 0x1FE0'0100u;
+    /// Size of the Timer address range in bytes (4 registers 脳 4 bytes).
+    static constexpr std::uint32_t RangeSizeBytes = 16u;
+
+    // 鈹€鈹€ MMIO interface 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    [[nodiscard]] std::uint32_t read32(std::uint32_t addr) override;
+    void write32(std::uint32_t addr, std::uint32_t value) override;
+
+    // 鈹€鈹€ Simulation interface 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+
+    /// Advance the internal counter by one tick.
+    /// If the timer is enabled and the counter reaches the threshold,
+    /// the pending-interrupt flag is set.
+    void tick();
+
+    /// @return true if an interrupt is waiting to be serviced.
+    [[nodiscard]] bool pending() const noexcept;
+
+    /// Acknowledge / clear the pending interrupt.
+    void clearPending() noexcept;
+
+private:
+    std::uint64_t m_ticks{0};
+    std::uint32_t m_threshold{0};   // 0 = no automatic interrupt
+    bool          m_enabled{false};
+    bool          m_interruptPending{false};
+};
+
+} // namespace loongarch
+
+
+==== Uart.h ====
+/**
+ * @file Uart.h
+ * @brief Simple memory-mapped UART device.
+ *
+ * This UART exposes a 32-bit register interface via the Device
+ * abstraction. Writes to the transmit register will print the lowest
+ * byte as an ASCII character to std::cout.
+ */
+
+#pragma once
+
+#include "Device.h"
+
+#include <cstdint>
+
+namespace loongarch
+{
+
+/**
+ * @brief Minimal UART implementation for console output.
+ *
+ * The UART is assumed to be mapped at a fixed physical base address
+ * (e.g. 0x1FE001E0) by the system bus. This class itself only sees
+ * addresses relative to its own base (offsets) and focuses on
+ * implementing the register behaviour.
+ *
+ * For now we model a single transmit register at offset 0:
+ * - write32(0, value): print low 8 bits as an ASCII character.
+ * - read32(0): always returns 0.
+ */
+class Uart final : public Device
+{
+public:
+    Uart() = default;
+    ~Uart() override = default;
+
+    Uart(const Uart&) = delete;
+    Uart& operator=(const Uart&) = delete;
+    Uart(Uart&&) = default;
+    Uart& operator=(Uart&&) = default;
+
+    /// Fixed physical base address for this UART in the system map.
+    /// This uses a more realistic high MMIO address.
+    static constexpr std::uint32_t PhysicalBase = 0x1FE0'01E0u;
+    /// Size of the UART address range in bytes.
+    static constexpr std::uint32_t RangeSizeBytes = 4u;
+
+    /// Read 32-bit value from UART register space (currently always 0).
+    [[nodiscard]] std::uint32_t read32(std::uint32_t addr) override;
+
+    /// Write 32-bit value to UART register space (TX at offset 0).
+    void write32(std::uint32_t addr, std::uint32_t value) override;
+};
+
+} // namespace loongarch
+
+

@@ -4,6 +4,7 @@
  */
 
 #include "Bus.h"
+#include "Timer.h"
 
 #include <stdexcept>
 #include <string>
@@ -11,14 +12,22 @@
 namespace loongarch
 {
 
-Bus::Bus(Memory& memory, Uart& uart) noexcept
+Bus::Bus(Memory& memory, Uart& uart, Timer& timer) noexcept
     : m_memory{memory}
     , m_uart{uart}
+    , m_timer{timer}
 {
 }
 
 std::uint32_t Bus::read32(std::uint32_t addr)
 {
+    // Route Timer MMIO range.
+    if (addr >= Timer::PhysicalBase &&
+        addr < (Timer::PhysicalBase + Timer::RangeSizeBytes)) {
+        const std::uint32_t offset = addr - Timer::PhysicalBase;
+        return m_timer.read32(offset);
+    }
+
     // Route UART MMIO range.
     if (addr >= Uart::PhysicalBase &&
         addr < (Uart::PhysicalBase + Uart::RangeSizeBytes)) {
@@ -38,6 +47,14 @@ std::uint32_t Bus::read32(std::uint32_t addr)
 
 void Bus::write32(std::uint32_t addr, std::uint32_t value)
 {
+    // Route Timer MMIO range.
+    if (addr >= Timer::PhysicalBase &&
+        addr < (Timer::PhysicalBase + Timer::RangeSizeBytes)) {
+        const std::uint32_t offset = addr - Timer::PhysicalBase;
+        m_timer.write32(offset, value);
+        return;
+    }
+
     // Route UART MMIO range.
     if (addr >= Uart::PhysicalBase &&
         addr < (Uart::PhysicalBase + Uart::RangeSizeBytes)) {

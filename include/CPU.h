@@ -17,6 +17,9 @@
 namespace loongarch
 {
 
+// 标志位枚举
+enum class AccessType { FETCH, LOAD, STORE };
+
 /**
  * @brief Minimal LoongArch CPU core.
  *
@@ -60,6 +63,13 @@ public:
     /// @return Pointer to the internal GPR array (size 32).
     [[nodiscard]] const std::uint32_t* registers() const noexcept;
 
+    // Test accessors for CSRs
+    void setCRMD(std::uint32_t value) noexcept { m_crmd = value; }
+    [[nodiscard]] std::uint32_t getCRMD() const noexcept { return m_crmd; }
+
+    void setPGDL(std::uint32_t value) noexcept { m_pgdl = value; }
+    [[nodiscard]] std::uint32_t getPGDL() const noexcept { return m_pgdl; }
+
     /**
      * @brief Execute a single instruction.
      *
@@ -78,6 +88,17 @@ public:
      */
     void step();
 
+    /**
+     * @brief Signal an external interrupt to the CPU.
+     *
+     * Sets the internal pending-interrupt flag so that the next
+     * call to step() will service it (if interrupts are enabled
+     * in CRMD).
+     *
+     * @param code  Exception/interrupt code to pass to raise_exception.
+     */
+    void signalInterrupt(std::uint32_t code) noexcept;
+
 private:
     Device&      m_bus;
     std::uint32_t m_regs[32]{};
@@ -86,16 +107,28 @@ private:
     // 简化版控制状态寄存器（CSR）
     // EPC   : 发生异常时的指令地址
     // ESTAT : 异常原因码等
-    // CRMD  : 当前模式/状态（这里先只作为占位）
+    // CRMD  : 当前模式/状态，bit 0 = IE（全局中断使能）
+    // ECFG  : 中断使能配置（预留）
     std::uint32_t m_epc{0};
     std::uint32_t m_estat{0};
-    std::uint32_t m_crmd{0};
+    std::uint32_t m_crmd{1};   // 默认使能中断 (IE=1)
+    std::uint32_t m_ecfg{0xFFFF'FFFFu}; // 默认全部中断源使能
+
+    // 外部中断信号
+    bool          m_interrupt_pending{false};
+    std::uint32_t m_interrupt_code{0};
+
+    // 内部寄存器：一级页表物理基地址
+    std::uint32_t m_pgdl{0};
 
     /// Ensure architectural invariants (e.g., regs[0] == 0).
     void enforceInvariants() noexcept;
 
     /// 触发架构级异常：保存 EPC/ESTAT 并跳转到异常入口。
     void raise_exception(std::uint32_t ex_code) noexcept;
+
+    // 返回转换后的物理地址。如果发生缺页或权限错误，抛出特定的异常或调用 raise_exception。
+    std::uint32_t translate_address(std::uint32_t vaddr, AccessType type);
 };
 
 } // namespace loongarch

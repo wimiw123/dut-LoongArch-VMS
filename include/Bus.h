@@ -12,6 +12,7 @@
 #include "Device.h"
 #include "Memory.h"
 #include "Uart.h"
+#include "Timer.h"
 
 #include <cstdint>
 
@@ -31,7 +32,7 @@ namespace loongarch
 class Bus final : public Device
 {
 public:
-    Bus(Memory& memory, Uart& uart) noexcept;
+    Bus(Memory& memory, Uart& uart, Timer& timer) noexcept;
     ~Bus() override = default;
 
     Bus(const Bus&) = delete;
@@ -45,6 +46,7 @@ public:
 private:
     Memory& m_memory;
     Uart&   m_uart;
+    Timer&  m_timer;
 };
 
 } // namespace loongarch

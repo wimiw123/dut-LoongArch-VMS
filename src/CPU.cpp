@@ -5,26 +5,29 @@
 
 #include "CPU.h"
 #include "decoder.h"
-
+#include <stdexcept>
 namespace loongarch
 {
 
 namespace
 {
 
-// 异常码（示例值，可根据实际 ISA 调整）
+// Exception codes (sample values, adjust per ISA)
 constexpr std::uint32_t EXC_ILLEGAL_INSTR = 1u;
 constexpr std::uint32_t EXC_ADDR_ERROR    = 2u;
 constexpr std::uint32_t EXC_SYSCALL       = 3u;
 
-// 辅助：安全读取 GPR
+// Hardware interrupt code (MSB=1 means interrupt, not sync exception)
+constexpr std::uint32_t EXC_TIMER_INT     = 0x80u;
+
+// Helper: safe GPR read
 inline std::uint32_t get_reg(const std::uint32_t (&regs)[32],
                              std::uint32_t        idx) noexcept
 {
     return (idx < 32u) ? regs[idx] : 0u;
 }
 
-// 辅助：安全写 GPR（允许写 x0，这里不做硬件约束，约束由 enforceInvariants 统一处理）
+// Helper: safe GPR write (x0 enforced by enforceInvariants)
 inline void set_reg(std::uint32_t (&regs)[32],
                     std::uint32_t idx,
                     std::uint32_t value) noexcept
@@ -71,6 +74,18 @@ const std::uint32_t* CPU::registers() const noexcept
 
 void CPU::step()
 {
+    // ============================
+    // Interrupt check (before fetch)
+    // ============================
+    // If an external interrupt is pending and CRMD IE bit allows,
+    // skip current instruction and jump to interrupt handler entry.
+    if (m_interrupt_pending && (m_crmd & 0x1u)) {
+        m_interrupt_pending = false;
+        raise_exception(m_interrupt_code);
+        enforceInvariants();
+        return;
+    }
+
     const std::uint32_t curr_pc = m_pc;
 
     // ============================
@@ -78,12 +93,13 @@ void CPU::step()
     // ============================
     //
     // Fetch a 32-bit instruction from memory at the current PC.
-    // 若底层总线抛出异常，将在上层转换为架构级异常。
+    // Bus exceptions are caught and converted to architectural exceptions.
     std::uint32_t instr = 0u;
     try {
-        instr = m_bus.read32(curr_pc);
-    } catch (const std::runtime_error&) {
-        m_pc = curr_pc; // 发生异常时 PC 指向出错指令
+        const std::uint32_t fetch_paddr = translate_address(curr_pc, AccessType::FETCH);
+        instr = m_bus.read32(fetch_paddr);
+    } catch (const std::runtime_error& /*unused*/) {
+        m_pc = curr_pc; // On exception, PC points to faulting instruction
         raise_exception(EXC_ADDR_ERROR);
         enforceInvariants();
         return;
@@ -97,20 +113,20 @@ void CPU::step()
     // ============================
     // Decode
     // ============================
-    // 解出通用寄存器字段
+    // Decode register fields
     const std::uint32_t rd = decode_rd(instr);
     const std::uint32_t rj = decode_rj(instr);
     const std::uint32_t rk = decode_rk(instr);
 
-    // 各类 opcode 视图
+    // Various opcode views
     const std::uint32_t opc6  = decode_opcode6(instr);
     const std::uint32_t opc12 = decode_opcode_2ri12(instr);
     const std::uint32_t opc3  = decode_opcode_3r(instr);
 
-    // 特殊全字编码指令：SYSCALL / ERTN（这里只实现 SYSCALL）
-    // SYSCALL: 高 17 位固定为 0x002B0，其余 15 位为立即数
+    // Full-word encoding: SYSCALL / ERTN (only SYSCALL implemented)
+    // SYSCALL: upper 17 bits fixed 0x002B0, lower 15 bits are imm
     if ( (instr & 0xFFFF8000u) == 0x002B0000u ) {
-        // 主动触发系统调用异常
+        // Trigger syscall exception
         m_pc = curr_pc + 4U;
         raise_exception(EXC_SYSCALL);
         enforceInvariants();
@@ -121,7 +137,9 @@ void CPU::step()
     // Execute
     // ============================
 
-    // 3R / 3R-like 指令：ADD.W / SUB.W / AND / OR / NOR / XOR / SLT / SLTU / SLL.W / SRL.W / SRA.W
+    try {
+
+    // 3R instructions: ADD.W / SUB.W / AND / OR / NOR / XOR / SLT / SLTU / SLL.W / SRL.W / SRA.W
     if (opc3 == OPC3_ADD_W  || opc3 == OPC3_SUB_W ||
         opc3 == OPC3_AND    || opc3 == OPC3_OR    ||
         opc3 == OPC3_XOR    || opc3 == OPC3_NOR   ||
@@ -155,31 +173,31 @@ void CPU::step()
             result = lhs ^ rhs;
             break;
         case OPC3_NOR:
-            // nor rd, rj, rk  (按位或非)
+            // nor rd, rj, rk  (bitwise NOR)
             result = ~(lhs | rhs);
             break;
         case OPC3_SLT: {
-            // slt rd, rj, rk  (有符号比较)
+            // slt rd, rj, rk  (signed compare)
             const std::int32_t sl = static_cast<std::int32_t>(lhs);
             const std::int32_t sr = static_cast<std::int32_t>(rhs);
             result = (sl < sr) ? 1u : 0u;
             break;
         }
         case OPC3_SLTU:
-            // sltu rd, rj, rk  (无符号比较)
+            // sltu rd, rj, rk  (unsigned compare)
             result = (lhs < rhs) ? 1u : 0u;
             break;
         case OPC3_SLL_W:
-            // sll.w rd, rj, rk  (逻辑左移，移位量取 rk 低 5 位)
+            // sll.w rd, rj, rk  (logical left shift, amount = rk[4:0])
             result = lhs << (rhs & 0x1Fu);
             break;
         case OPC3_SRL_W:
-            // srl.w rd, rj, rk  (逻辑右移)
+            // srl.w rd, rj, rk  (logical right shift)
             result = static_cast<std::uint32_t>(
                 static_cast<std::uint32_t>(lhs) >> (rhs & 0x1Fu));
             break;
         case OPC3_SRA_W:
-            // sra.w rd, rj, rk  (算术右移)
+            // sra.w rd, rj, rk  (arithmetic right shift)
             result = static_cast<std::uint32_t>(
                 static_cast<std::int32_t>(lhs) >> (rhs & 0x1Fu));
             break;
@@ -189,7 +207,7 @@ void CPU::step()
 
         set_reg(m_regs, rd, result);
     }
-    // 移位立即数指令：SLLI.W / SRLI.W / SRAI.W
+    // Shift-immediate: SLLI.W / SRLI.W / SRAI.W
     else if (opc3 == OPC3_SLLI_W ||
              opc3 == OPC3_SRLI_W ||
              opc3 == OPC3_SRAI_W) {
@@ -204,12 +222,12 @@ void CPU::step()
             result = src << shamt;
             break;
         case OPC3_SRLI_W:
-            // srli.w rd, rj, ui5  (逻辑右移)
+            // srli.w rd, rj, ui5  (logical right shift)
             result = static_cast<std::uint32_t>(
                 static_cast<std::uint32_t>(src) >> shamt);
             break;
         case OPC3_SRAI_W:
-            // srai.w rd, rj, ui5  (算术右移)
+            // srai.w rd, rj, ui5  (arithmetic right shift)
             result = static_cast<std::uint32_t>(
                 static_cast<std::int32_t>(src) >> shamt);
             break;
@@ -219,7 +237,7 @@ void CPU::step()
 
         set_reg(m_regs, rd, result);
     }
-    // 2RI12 指令：ADDI.W / 逻辑立即数 / 比较立即数 / 各类访存
+    // 2RI12: ADDI.W / logical-imm / compare-imm / loads-stores
     else if (opc12 == OPC2_ADDI_W ||
              opc12 == OPC2_ANDI   ||
              opc12 == OPC2_ORI    ||
@@ -236,8 +254,8 @@ void CPU::step()
              opc12 == OPC2_ST_W) {
 
         const std::uint32_t base = get_reg(m_regs, rj);
-        const std::int32_t  simm = decode_imm12(instr);      // 符号扩展立即数
-        const std::uint32_t uimm = decode_uimm12(instr);     // 零扩展立即数
+        const std::int32_t  simm = decode_imm12(instr);      // sign-extended immediate
+        const std::uint32_t uimm = decode_uimm12(instr);     // zero-extended immediate
 
         switch (opc12) {
         case OPC2_ADDI_W: {
@@ -248,7 +266,7 @@ void CPU::step()
             break;
         }
         case OPC2_ANDI:
-            // andi rd, rj, ui12  (零扩展)
+            // andi rd, rj, ui12  (zero-extended)
             set_reg(m_regs, rd, base & uimm);
             break;
         case OPC2_ORI:
@@ -260,14 +278,14 @@ void CPU::step()
             set_reg(m_regs, rd, base ^ uimm);
             break;
         case OPC2_SLTI: {
-            // slti rd, rj, si12  (有符号比较)
+            // slti rd, rj, si12  (signed compare)
             const std::int32_t sl = static_cast<std::int32_t>(base);
             const std::int32_t sr = simm;
             set_reg(m_regs, rd, (sl < sr) ? 1u : 0u);
             break;
         }
         case OPC2_SLTUI: {
-            // sltui rd, rj, si12  (无符号比较，立即数先符号扩展再解释为无符号)
+            // sltui rd, rj, si12  (unsigned compare, imm sign-extended then unsigned)
             const std::uint32_t ul =
                 static_cast<std::uint32_t>(base);
             const std::uint32_t ur =
@@ -280,22 +298,23 @@ void CPU::step()
         case OPC2_LD_W:
         case OPC2_LD_BU:
         case OPC2_LD_HU: {
-            // 加载类：vaddr = rj + sign_ext(si12)
+            // Load: vaddr = rj + sign_ext(si12)
             const std::uint32_t addr =
                 static_cast<std::uint32_t>(
                     static_cast<std::int32_t>(base) + simm);
+            const std::uint32_t paddr = translate_address(addr, AccessType::LOAD);
 
             if (opc12 == OPC2_LD_W) {
-                const std::uint32_t value = m_bus.read32(addr);
+                const std::uint32_t value = m_bus.read32(paddr);
                 set_reg(m_regs, rd, value);
             } else {
-                // 使用对齐的 32 位访问，再从中抽取字节/半字
+                // Use aligned 32-bit access, extract byte/halfword
                 const std::uint32_t aligned =
-                    addr & ~0x3u;
+                    paddr & ~0x3u;
                 const std::uint32_t word =
                     m_bus.read32(aligned);
                 const std::uint32_t byteIndex =
-                    addr & 0x3u;
+                    paddr & 0x3u;
 
                 if (opc12 == OPC2_LD_B ||
                     opc12 == OPC2_LD_BU) {
@@ -311,10 +330,10 @@ void CPU::step()
                         set_reg(m_regs, rd,
                                 static_cast<std::uint32_t>(b));
                     }
-                } else { // 半字
-                    // 要求半字地址 2 字节对齐；简化实现
+                } else { // halfword
+                    // halfword addr 2-byte aligned; simplified
                     const std::uint32_t halfIndex =
-                        (addr & 0x2u) >> 1u; // 0 或 1
+                        (addr & 0x2u) >> 1u; // 0 or 1
                     const std::uint16_t h =
                         static_cast<std::uint16_t>(
                             (word >> (halfIndex * 16u)) & 0xFFFFu);
@@ -334,19 +353,20 @@ void CPU::step()
         case OPC2_ST_B:
         case OPC2_ST_H:
         case OPC2_ST_W: {
-            // 存储类：vaddr = rj + sign_ext(si12)
+            // Store: vaddr = rj + sign_ext(si12)
             const std::uint32_t addr =
                 static_cast<std::uint32_t>(
                     static_cast<std::int32_t>(base) + simm);
             const std::uint32_t value = get_reg(m_regs, rd);
+            const std::uint32_t paddr = translate_address(addr, AccessType::STORE);
 
             if (opc12 == OPC2_ST_W) {
-                m_bus.write32(addr, value);
+                m_bus.write32(paddr, value);
             } else {
                 const std::uint32_t aligned =
-                    addr & ~0x3u;
+                    paddr & ~0x3u;
                 const std::uint32_t byteIndex =
-                    addr & 0x3u;
+                    paddr & 0x3u;
 
                 std::uint32_t word =
                     m_bus.read32(aligned);
@@ -358,9 +378,9 @@ void CPU::step()
                         (value & 0xFFu) << (byteIndex * 8u);
                     word = (word & mask) | ins;
                 } else { // ST.H
-                    // 简化：要求半字地址 2 字节对齐
+                    // Simplified: halfword address must be 2-byte aligned
                     const std::uint32_t halfIndex =
-                        (addr & 0x2u) >> 1u; // 0 或 1
+                        (addr & 0x2u) >> 1u; // 0 or 1
                     const std::uint32_t mask =
                         ~(0xFFFFu << (halfIndex * 16u));
                     const std::uint32_t ins =
@@ -376,9 +396,9 @@ void CPU::step()
             break;
         }
     }
-    // 1RI21 高位立即数：LU12I.W rd, si20
+    // 1RI21 upper immediate: LU12I.W rd, si20
     else if (opc6 == OPC_LU12I_W) {
-        // imm20: 假定位于 [24:5]，先作为 20 位有符号数，再左移 12 位
+        // imm20: assumed [24:5], 20-bit signed, then left-shift 12
         const std::uint32_t raw20 =
             extract_bits(instr, 5u, 20u);
         const std::int32_t si20 =
@@ -389,7 +409,7 @@ void CPU::step()
 
         set_reg(m_regs, rd, value);
     }
-    // 1RI21 PC 相对寻址：PCADDU12I rd, si20
+    // 1RI21 PC-relative: PCADDU12I rd, si20
     else if (opc6 == OPC_PCADDU12I) {
         // rd = PC + sign_ext(si20 << 12)
         const std::uint32_t raw20 =
@@ -405,7 +425,7 @@ void CPU::step()
         set_reg(m_regs, rd,
                 static_cast<std::uint32_t>(sum));
     }
-    // 2RI16 分支与跳转：BEQ / BNE / BLT / BGE / JIRL / B / BL
+    // 2RI16 branch/jump: BEQ / BNE / BLT / BGE / JIRL / B / BL
     else if (opc6 == OPC_BEQ ||
              opc6 == OPC_BNE ||
              opc6 == OPC_BLT ||
@@ -422,7 +442,7 @@ void CPU::step()
 
             const std::uint32_t raw16 =
                 extract_bits(instr, 10u, 16u);
-            // 左移 2 位后按 18 位符号扩展得到字节偏移
+            // left-shift 2, then sign-extend to 18-bit byte offset
             const std::int32_t offsetBytes =
                 sign_extend<18>(raw16 << 2u);
 
@@ -479,7 +499,7 @@ void CPU::step()
                 }
             }
         } else {
-            // B / BL: I26 绝对偏移，相对 PC
+            // B / BL: I26 offset relative to PC
             const std::uint32_t low10 =
                 extract_bits(instr, 0u, 10u);
             const std::uint32_t high16 =
@@ -487,7 +507,7 @@ void CPU::step()
             const std::uint32_t raw26 =
                 (high16 << 10u) | low10;
 
-            // 左移 2 位得到 28 位偏移，然后按 28 位符号扩展
+            // left-shift 2 -> 28-bit offset, sign-extend 28
             const std::uint32_t shifted =
                 raw26 << 2u;
             const std::int32_t offsetBytes =
@@ -506,9 +526,16 @@ void CPU::step()
         }
     }
     else {
-        // 其他指令暂未实现：触发非法指令异常
+        // Unimplemented instruction: raise illegal instruction exception
         m_pc = curr_pc + 4U;
         raise_exception(EXC_ILLEGAL_INSTR);
+    }
+
+    } catch (const std::runtime_error& /*unused*/) {
+        m_pc = curr_pc; // rollback PC to point to faulting load/store
+        raise_exception(EXC_ADDR_ERROR);
+        enforceInvariants();
+        return;
     }
 
     // Enforce architectural invariants after executing the instruction.
@@ -524,16 +551,57 @@ void CPU::enforceInvariants() noexcept
 
 void CPU::raise_exception(std::uint32_t ex_code) noexcept
 {
-    // 固定异常入口基址，可根据需要增加按异常码划分偏移。
+    // Fixed exception handler base; offset by exception code.
     constexpr std::uint32_t EXC_BASE = 0x1C00'0000u;
     constexpr std::uint32_t EXC_STRIDE = 0x100u;
 
-    m_epc   = m_pc;      // 保存当前 PC
-    m_estat = ex_code;   // 记录异常原因
+    m_epc   = m_pc;      // Save current PC
+    m_estat = ex_code;   // Record exception cause
 
-    // 简单策略：不同异常码跳转到不同的入口偏移
+    // Simple: each exception code jumps to a different entry offset
     const std::uint32_t offset = ex_code * EXC_STRIDE;
     m_pc = EXC_BASE + offset;
+
+    // Disable global interrupt on exception entry to prevent nesting
+    m_crmd &= ~0x1u;
+}
+
+void CPU::signalInterrupt(std::uint32_t code) noexcept
+{
+    m_interrupt_pending = true;
+    m_interrupt_code    = code;
+}
+
+std::uint32_t CPU::translate_address(std::uint32_t vaddr, AccessType type)
+{
+    // m_crmd bit 3 is PG (Paging) bit
+    bool pg = (m_crmd & (1u << 3)) != 0;
+    if (!pg) {
+        return vaddr;
+    }
+
+    std::uint32_t pd_idx = (vaddr >> 22) & 0x3FFu;
+    std::uint32_t pt_idx = (vaddr >> 12) & 0x3FFu;
+    std::uint32_t offset = vaddr & 0xFFFu;
+
+    std::uint32_t pde_addr = (m_pgdl & 0xFFFFF000u) + (pd_idx * 4u);
+    std::uint32_t pde = m_bus.read32(pde_addr);
+
+    // Assume bit 0 is Valid bit
+    if ((pde & 0x1u) == 0) {
+        throw std::runtime_error("MMU PDE Invalid");
+    }
+
+    std::uint32_t pt_base = (pde & 0xFFFFF000u);
+    std::uint32_t pte_addr = pt_base + (pt_idx * 4u);
+    std::uint32_t pte = m_bus.read32(pte_addr);
+
+    if ((pte & 0x1u) == 0) {
+        throw std::runtime_error("MMU PTE Invalid");
+    }
+
+    std::uint32_t ppn = (pte & 0xFFFFF000u);
+    return ppn | offset;
 }
 
 } // namespace loongarch
