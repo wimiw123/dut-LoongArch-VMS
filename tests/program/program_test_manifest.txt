@@ -1,0 +1,12 @@
+# name          path                           expected_exit_code
+test_pass       ../programs/test_pass.hex      0
+test_fail       ../programs/test_fail.hex      1
+trap_pass       ../programs/trap_pass.hex      0
+trap_fail       ../programs/trap_fail.hex      2
+check_fail      ../programs/check_fail.hex     1
+branch_pass     ../programs/branch_pass.hex    0
+branch_fail     ../programs/branch_fail.hex    3
+load_store_pass  ../programs/load_store_pass.hex  0
+load_store_fail  ../programs/load_store_fail.hex  4
+array_pass  ../programs/array_pass.hex  0
+array_fail  ../programs/array_fail.hex  5

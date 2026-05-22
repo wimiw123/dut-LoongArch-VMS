@@ -1,134 +1,142 @@
-/**
- * @file CPU.h
- * @brief Basic LoongArch CPU core skeleton.
- *
- * This header declares a minimal CPU model with 32 general-purpose
- * registers and a program counter, plus a single-step execution
- * function using a classic Fetch/Decode/Execute pipeline skeleton.
- */
-
 #pragma once
 
 #include "Device.h"
 
-#include <cstdint>
 #include <cstddef>
+#include <cstdint>
+#include <memory>
 
 namespace loongarch
 {
 
-// 标志位枚举
-enum class AccessType { FETCH, LOAD, STORE };
+enum class AccessType
+{
+    FETCH,
+    LOAD,
+    STORE,
+};
 
-/**
- * @brief Minimal LoongArch CPU core.
- *
- * This CPU model owns a reference to a @c Device instance (typically a
- * system bus) and maintains architectural state:
- * - 32 general-purpose registers (GPRs), each 32 bits wide.
- * - A 32-bit program counter (PC).
- *
- * By convention, @c regs[0] is hard-wired to zero; the implementation
- * ensures this invariant after each step.
- */
+enum class CoreMode
+{
+    BaselineSequential,
+    AdvancedTomasulo,
+};
+
+struct CoreMetrics
+{
+    std::uint64_t fetched_instructions{0};
+    std::uint64_t decoded_instructions{0};
+    std::uint64_t issued_instructions{0};
+    std::uint64_t executed_instructions{0};
+    std::uint64_t committed_instructions{0};
+    std::uint64_t serialized_cycles{0};
+
+    std::uint64_t branch_instructions{0};
+    std::uint64_t dynamic_branch_predictions{0};
+    std::uint64_t branch_prediction_hits{0};
+    std::uint64_t branch_prediction_misses{0};
+    std::uint64_t pipeline_flushes{0};
+    std::uint64_t speculative_instructions_squashed{0};
+
+    std::uint64_t register_renames{0};
+    std::uint64_t out_of_order_completions{0};
+    std::uint64_t load_store_forwardings{0};
+
+    std::uint64_t rob_full_stalls{0};
+    std::uint64_t rs_full_stalls{0};
+    std::uint64_t decode_stalls{0};
+    std::uint64_t issue_stalls{0};
+    std::uint64_t load_store_order_stalls{0};
+
+    std::uint64_t rob_occupancy_samples{0};
+    std::uint64_t rs_occupancy_samples{0};
+    std::uint64_t inflight_occupancy_samples{0};
+    std::uint64_t max_rob_occupancy{0};
+    std::uint64_t max_rs_occupancy{0};
+    std::uint64_t max_inflight_instructions{0};
+};
+
+struct AdvancedState;
+
 class CPU
 {
-public:
-    /**
-     * @brief Construct a CPU core bound to a bus device.
-     *
-     * @param bus The system bus handling instruction and data accesses.
-     *        The caller must ensure the lifetime of @p bus exceeds that
-     *        of the CPU instance.
-     */
-    explicit CPU(Device& bus) noexcept;
+  public:
+    explicit CPU(Device &bus);
+    ~CPU();
 
-    CPU(const CPU&) = delete;
-    CPU& operator=(const CPU&) = delete;
-    CPU(CPU&&) = default;
-    CPU& operator=(CPU&&) = default;
+    CPU(const CPU &) = delete;
+    CPU &operator=(const CPU &) = delete;
+    CPU(CPU &&) noexcept;
+    CPU &operator=(CPU &&) = delete;
 
-    /// @return Reference to the underlying bus device.
-    [[nodiscard]] Device& bus() noexcept;
+    [[nodiscard]] Device &bus() noexcept;
+    [[nodiscard]] const Device &bus() const noexcept;
 
-    /// @return Const reference to the underlying bus device.
-    [[nodiscard]] const Device& bus() const noexcept;
-
-    /// @return Current program counter value.
     [[nodiscard]] std::uint32_t getPC() const noexcept;
-
-    /// Set the program counter to a new value.
     void setPC(std::uint32_t newPc) noexcept;
 
-    /// @return Pointer to the internal GPR array (size 32).
-    [[nodiscard]] const std::uint32_t* registers() const noexcept;
+    [[nodiscard]] const std::uint32_t *registers() const noexcept;
+    [[nodiscard]] std::uint32_t getReg(std::size_t index) const noexcept;
+    void setReg(std::size_t index, std::uint32_t value) noexcept;
 
-    // Test accessors for CSRs
-    void setCRMD(std::uint32_t value) noexcept { m_crmd = value; }
-    [[nodiscard]] std::uint32_t getCRMD() const noexcept { return m_crmd; }
+    void setCRMD(std::uint32_t value) noexcept;
+    [[nodiscard]] std::uint32_t getCRMD() const noexcept;
 
-    void setPGDL(std::uint32_t value) noexcept { m_pgdl = value; }
-    [[nodiscard]] std::uint32_t getPGDL() const noexcept { return m_pgdl; }
+    void setPGDL(std::uint32_t value) noexcept;
+    [[nodiscard]] std::uint32_t getPGDL() const noexcept;
 
-    /**
-     * @brief Execute a single instruction.
-     *
-     * This performs a classic three-stage pipeline in a single
-     * function:
-     * - Fetch:  read 32-bit instruction from @c pc and increment @c pc by 4.
-     * - Decode: derive opcode/operands from the raw instruction word.
-     * - Execute: perform the operation, possibly reading/writing memory
-     *   and registers.
-     *
-     * The current implementation only contains a high-level skeleton;
-     * the real instruction semantics should be filled in later.
-     *
-     * @throws std::runtime_error if the fetch causes an invalid memory
-     *         access (propagated from @c Device::read32).
-     */
+    void reset(std::uint32_t resetPc = 0) noexcept;
     void step();
 
-    /**
-     * @brief Signal an external interrupt to the CPU.
-     *
-     * Sets the internal pending-interrupt flag so that the next
-     * call to step() will service it (if interrupts are enabled
-     * in CRMD).
-     *
-     * @param code  Exception/interrupt code to pass to raise_exception.
-     */
     void signalInterrupt(std::uint32_t code) noexcept;
 
-private:
-    Device&      m_bus;
+    [[nodiscard]] std::uint64_t getCycleCount() const noexcept;
+    [[nodiscard]] CoreMode getCoreMode() const noexcept;
+    [[nodiscard]] const char *getCoreModeName() const noexcept;
+    [[nodiscard]] const CoreMetrics &getCoreMetrics() const noexcept;
+
+    void dumpRegisters() const;
+    void dumpState() const;
+
+  private:
+    Device &m_bus;
     std::uint32_t m_regs[32]{};
     std::uint32_t m_pc{0};
 
-    // 简化版控制状态寄存器（CSR）
-    // EPC   : 发生异常时的指令地址
-    // ESTAT : 异常原因码等
-    // CRMD  : 当前模式/状态，bit 0 = IE（全局中断使能）
-    // ECFG  : 中断使能配置（预留）
     std::uint32_t m_epc{0};
     std::uint32_t m_estat{0};
-    std::uint32_t m_crmd{1};   // 默认使能中断 (IE=1)
-    std::uint32_t m_ecfg{0xFFFF'FFFFu}; // 默认全部中断源使能
+    std::uint32_t m_crmd{1};
+    std::uint32_t m_ecfg{0xFFFF'FFFFu};
 
-    // 外部中断信号
-    bool          m_interrupt_pending{false};
+    bool m_interrupt_pending{false};
     std::uint32_t m_interrupt_code{0};
-
-    // 内部寄存器：一级页表物理基地址
     std::uint32_t m_pgdl{0};
+    std::uint64_t m_cycle_count{0};
 
-    /// Ensure architectural invariants (e.g., regs[0] == 0).
+    double m_fregs[32]{};
+    std::uint32_t m_fcsr{0};
+    std::uint8_t m_fcc{0};
+    std::uint32_t m_csr[16384]{};
+    bool m_llbit{false};
+    std::uint32_t m_lladdr{0};
+
+    CoreMode m_core_mode{CoreMode::AdvancedTomasulo};
+    CoreMetrics m_metrics{};
+    std::unique_ptr<AdvancedState> m_advanced;
+
+    void stepBaseline();
+    void stepAdvanced();
+
     void enforceInvariants() noexcept;
-
-    /// 触发架构级异常：保存 EPC/ESTAT 并跳转到异常入口。
     void raise_exception(std::uint32_t ex_code) noexcept;
-
-    // 返回转换后的物理地址。如果发生缺页或权限错误，抛出特定的异常或调用 raise_exception。
     std::uint32_t translate_address(std::uint32_t vaddr, AccessType type);
+
+    [[nodiscard]] std::uint32_t read_u8(std::uint32_t vaddr);
+    [[nodiscard]] std::uint32_t read_u16(std::uint32_t vaddr);
+    [[nodiscard]] std::uint32_t read_u32(std::uint32_t vaddr);
+    void write_u8(std::uint32_t vaddr, std::uint32_t value);
+    void write_u16(std::uint32_t vaddr, std::uint32_t value);
+    void write_u32(std::uint32_t vaddr, std::uint32_t value);
 };
 
 } // namespace loongarch

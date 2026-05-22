@@ -1,0 +1,56 @@
+LoongArch VM Minimal Speedup Report
+Generated: 2026-04-02
+
+Goal
+- Use minimal, low-risk changes to speed up simulation.
+- Keep the existing test workflow (`toolchain/run_c_tests.sh`) and preserve correctness.
+
+Final Changes Kept
+1) Default host build to Release when build type is not specified.
+- File: `CMakeLists.txt`
+- Reason: host-side optimization directly reduces simulator overhead.
+
+2) Stop unintended per-step logging in normal runs.
+- File: `src/SimulatorRunner.cpp`
+- Change: `if (step < 100)` -> `if (trace && step < 100)`
+- Reason: remove console I/O cost on non-trace runs.
+
+3) Disable trace by default, keep optional trace and framework-compatible step output.
+- File: `src/simulator_main.cpp`
+- Changes:
+  - default `trace = false`
+  - optional `--trace`
+  - output `[SIM] halted after ...` / `[SIM] reached max_steps ...` for test parser
+- Reason: preserve compatibility while reducing default runtime overhead.
+
+4) Add aligned fast path for 32-bit load/store.
+- File: `src/CPU.cpp`
+- Changes:
+  - added `read_u32` / `write_u32`
+  - aligned address: one address translation + one bus 32-bit access
+  - unaligned address: fallback to existing byte-wise behavior
+- Reason: reduce hot-path memory access overhead without changing unaligned behavior.
+
+5) Minor script hygiene only (no semantic speed impact).
+- File: `toolchain/build_c_program.sh`
+- Change: CFLAGS can be overridden by environment while keeping original default flags.
+
+Change Tried Then Rolled Back
+- File: `toolchain/build_c_program.sh`
+- Attempt: default guest compile flags changed to `-O2 -DNDEBUG`
+- Result: 28/42 passed (14 failed), so this was reverted to keep correctness.
+
+Validation
+Command used:
+- `bash toolchain/run_c_tests.sh`
+
+Final result after kept changes:
+- C Tests PASS
+- 42 / 42 passed
+- Summary: 42 passed, 0 failed, 42 total
+- Scored time: 811.892 ms
+- Total time: 13021.673 ms
+
+Conclusion
+- The final kept modifications are minimal and correctness-safe under the current test suite.
+- Performance improved while maintaining full pass rate.

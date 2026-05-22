@@ -1,0 +1,87 @@
+=== C Program Test Runner ===
+[INFO] building test_main from programs/test_main.c
+[FAIL] test_main        build failed
+[INFO] building test_fail_main from programs/test_fail_main.c
+[FAIL] test_fail_main   build failed
+[INFO] building test_check_fail from programs/test_check_fail.c
+[FAIL] test_check_fail  build failed
+[INFO] building test_add from programs/test_add.c
+[FAIL] test_add         build failed
+[INFO] building test_if_else from programs/test_if_else.c
+[FAIL] test_if_else     build failed
+[INFO] building test_fact from programs/test_fact.c
+[FAIL] test_fact        build failed
+[INFO] building test_fib from programs/test_fib.c
+[FAIL] test_fib         build failed
+[INFO] building add-longlong from my_programs_c/add-longlong.c
+[FAIL] add-longlong     build failed
+[INFO] building add from my_programs_c/add.c
+[FAIL] add              build failed
+[INFO] building bit from my_programs_c/bit.c
+[FAIL] bit              build failed
+[INFO] building bubble-sort from my_programs_c/bubble-sort.c
+[FAIL] bubble-sort      build failed
+[INFO] building crc32 from my_programs_c/crc32.c
+[FAIL] crc32            build failed
+[INFO] building div from my_programs_c/div.c
+[FAIL] div              build failed
+[INFO] building dummy from my_programs_c/dummy.c
+[FAIL] dummy            build failed
+[INFO] building fact from my_programs_c/fact.c
+[FAIL] fact             build failed
+[INFO] building fib from my_programs_c/fib.c
+[FAIL] fib              build failed
+[INFO] building goldbach from my_programs_c/goldbach.c
+[FAIL] goldbach         build failed
+[INFO] building hello-str from my_programs_c/hello-str.c
+[FAIL] hello-str        build failed
+[INFO] building if-else from my_programs_c/if-else.c
+[FAIL] if-else          build failed
+[INFO] building leap-year from my_programs_c/leap-year.c
+[FAIL] leap-year        build failed
+[INFO] building load-store from my_programs_c/load-store.c
+[FAIL] load-store       build failed
+[INFO] building matrix-mul from my_programs_c/matrix-mul.c
+[FAIL] matrix-mul       build failed
+[INFO] building max from my_programs_c/max.c
+[FAIL] max              build failed
+[INFO] building mersenne from my_programs_c/mersenne.c
+[FAIL] mersenne         build failed
+[INFO] building min3 from my_programs_c/min3.c
+[FAIL] min3             build failed
+[INFO] building mov-c from my_programs_c/mov-c.c
+[FAIL] mov-c            build failed
+[INFO] building movsx from my_programs_c/movsx.c
+[FAIL] movsx            build failed
+[INFO] building mul-longlong from my_programs_c/mul-longlong.c
+[FAIL] mul-longlong     build failed
+[INFO] building pascal from my_programs_c/pascal.c
+[FAIL] pascal           build failed
+[INFO] building prime from my_programs_c/prime.c
+[FAIL] prime            build failed
+[INFO] building quick-sort from my_programs_c/quick-sort.c
+[FAIL] quick-sort       build failed
+[INFO] building recursion from my_programs_c/recursion.c
+[FAIL] recursion        build failed
+[INFO] building select-sort from my_programs_c/select-sort.c
+[FAIL] select-sort      build failed
+[INFO] building shift from my_programs_c/shift.c
+[FAIL] shift            build failed
+[INFO] building shuixianhua from my_programs_c/shuixianhua.c
+[FAIL] shuixianhua      build failed
+[INFO] building string from my_programs_c/string.c
+[FAIL] string           build failed
+[INFO] building sub-longlong from my_programs_c/sub-longlong.c
+[FAIL] sub-longlong     build failed
+[INFO] building sum from my_programs_c/sum.c
+[FAIL] sum              build failed
+[INFO] building switch from my_programs_c/switch.c
+[FAIL] switch           build failed
+[INFO] building to-lower-case from my_programs_c/to-lower-case.c
+[FAIL] to-lower-case    build failed
+[INFO] building unalign from my_programs_c/unalign.c
+[FAIL] unalign          build failed
+[INFO] building wanshu from my_programs_c/wanshu.c
+[FAIL] wanshu           build failed
+
+Summary: 0 passed, 42 failed, 42 total

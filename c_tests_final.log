@@ -1,0 +1,134 @@
+=== C Program Test Runner ===
+Running C Tests [sim *build/mycpu_sim*]
+
+[test_main] test_main.c: Passed.
+time: 18.398 ms [34 steps]
+
+[test_fail_main] test_fail_main.c: Passed.
+time: 18.542 ms [20 steps]
+
+[test_check_fail] test_check_fail.c: Passed.
+time: 18.650 ms [24 steps]
+
+[test_add] test_add.c: Passed.
+time: 20.566 ms [57 steps]
+
+[test_if_else] test_if_else.c: Passed.
+time: 20.679 ms [51 steps]
+
+[test_fact] test_fact.c: Passed.
+time: 18.843 ms [139 steps]
+
+[test_fib] test_fib.c: Passed.
+time: 18.060 ms [1480 steps]
+
+[add-longlong] add-longlong.c: Passed.
+time: 18.367 ms [5663 steps]
+
+[add] add.c: Passed.
+time: 18.438 ms [4399 steps]
+
+[bit] bit.c: Passed.
+time: 18.639 ms [783 steps]
+
+[bubble-sort] bubble-sort.c: Passed.
+time: 20.179 ms [13212 steps]
+
+[crc32] crc32.c: Passed.
+time: 19.107 ms [36873 steps]
+
+[div] div.c: Passed.
+time: 19.152 ms [4840 steps]
+
+[dummy] dummy.c: Passed.
+time: 19.499 ms [18 steps]
+
+[fact] fact.c: Passed.
+time: 18.789 ms [2306 steps]
+
+[fib] fib.c: Passed.
+time: 19.099 ms [2289 steps]
+
+[goldbach] goldbach.c: Passed.
+time: 18.971 ms [4867 steps]
+
+[hello-str] hello-str.c: Passed.
+time: 17.811 ms [1793 steps]
+
+[if-else] if-else.c: Passed.
+time: 19.007 ms [941 steps]
+
+[leap-year] leap-year.c: Passed.
+time: 20.183 ms [6815 steps]
+
+[load-store] load-store.c: Passed.
+time: 19.475 ms [1219 steps]
+
+[matrix-mul] matrix-mul.c: Passed.
+time: 18.714 ms [65166 steps]
+
+[max] max.c: Passed.
+time: 18.181 ms [4491 steps]
+
+[mersenne] mersenne.c: Passed.
+time: 26.409 ms [434629 steps]
+
+[min3] min3.c: Passed.
+time: 20.556 ms [5603 steps]
+
+[mov-c] mov-c.c: Passed.
+time: 20.947 ms [211 steps]
+
+[movsx] movsx.c: Passed.
+time: 19.812 ms [338 steps]
+
+[mul-longlong] mul-longlong.c: Passed.
+time: 18.650 ms [1135 steps]
+
+[pascal] pascal.c: Passed.
+time: 20.786 ms [12289 steps]
+
+[prime] prime.c: Passed.
+time: 19.210 ms [14504 steps]
+
+[quick-sort] quick-sort.c: Passed.
+time: 19.251 ms [8811 steps]
+
+[recursion] recursion.c: Passed.
+time: 18.934 ms [8642 steps]
+
+[select-sort] select-sort.c: Passed.
+time: 18.332 ms [10280 steps]
+
+[shift] shift.c: Passed.
+time: 20.055 ms [1019 steps]
+
+[shuixianhua] shuixianhua.c: Passed.
+time: 18.816 ms [29370 steps]
+
+[string] string.c: Passed.
+time: 18.336 ms [3476 steps]
+
+[sub-longlong] sub-longlong.c: Passed.
+time: 18.653 ms [5661 steps]
+
+[sum] sum.c: Passed.
+time: 19.286 ms [1050 steps]
+
+[switch] switch.c: Passed.
+time: 19.478 ms [1042 steps]
+
+[to-lower-case] to-lower-case.c: Passed.
+time: 18.345 ms [6846 steps]
+
+[unalign] unalign.c: Passed.
+time: 18.637 ms [221 steps]
+
+[wanshu] wanshu.c: Passed.
+time: 20.053 ms [5334 steps]
+
+C Tests PASS
+42 / 42 passed
+Summary: 42 passed, 0 failed, 42 total
+Scored time: 811.892 ms
+Total time: 13021.673 ms

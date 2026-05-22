@@ -1,0 +1,113 @@
+=== C Program Test Runner ===
+Running C Tests [sim *toolchain/mycpu_sim_baseline.sh*]
+
+[add-longlong] add-longlong.c: Passed.
+time: 0.246 ms [5663 steps]
+
+[add] add.c: Passed.
+time: 0.203 ms [4399 steps]
+
+[bit] bit.c: Passed.
+time: 0.062 ms [783 steps]
+
+[bubble-sort] bubble-sort.c: Passed.
+time: 0.552 ms [13212 steps]
+
+[crc32] crc32.c: Passed.
+time: 1.442 ms [36873 steps]
+
+[div] div.c: Passed.
+time: 0.345 ms [4840 steps]
+
+[dummy] dummy.c: Passed.
+time: 0.004 ms [18 steps]
+
+[fact] fact.c: Passed.
+time: 0.087 ms [2306 steps]
+
+[fib] fib.c: Passed.
+time: 0.142 ms [2289 steps]
+
+[goldbach] goldbach.c: Passed.
+time: 0.445 ms [4867 steps]
+
+[hello-str] hello-str.c: Passed.
+time: 0.088 ms [1793 steps]
+
+[if-else] if-else.c: Passed.
+time: 0.040 ms [941 steps]
+
+[leap-year] leap-year.c: Passed.
+time: 0.291 ms [6815 steps]
+
+[load-store] load-store.c: Passed.
+time: 0.051 ms [1219 steps]
+
+[matrix-mul] matrix-mul.c: Passed.
+time: 3.628 ms [65166 steps]
+
+[max] max.c: Passed.
+time: 0.307 ms [4491 steps]
+
+[mersenne] mersenne.c: Passed.
+time: 20.546 ms [434629 steps]
+
+[min3] min3.c: Passed.
+time: 0.316 ms [5603 steps]
+
+[mov-c] mov-c.c: Passed.
+time: 0.013 ms [211 steps]
+
+[movsx] movsx.c: Passed.
+time: 0.030 ms [338 steps]
+
+[mul-longlong] mul-longlong.c: Passed.
+time: 0.083 ms [1135 steps]
+
+[pascal] pascal.c: Passed.
+time: 0.843 ms [12289 steps]
+
+[prime] prime.c: Passed.
+time: 1.034 ms [14504 steps]
+
+[quick-sort] quick-sort.c: Passed.
+time: 0.761 ms [8811 steps]
+
+[recursion] recursion.c: Passed.
+time: 0.328 ms [8642 steps]
+
+[select-sort] select-sort.c: Passed.
+time: 0.354 ms [10280 steps]
+
+[shift] shift.c: Passed.
+time: 0.076 ms [1019 steps]
+
+[shuixianhua] shuixianhua.c: Passed.
+time: 1.764 ms [29370 steps]
+
+[string] string.c: Passed.
+time: 0.234 ms [3476 steps]
+
+[sub-longlong] sub-longlong.c: Passed.
+time: 0.260 ms [5661 steps]
+
+[sum] sum.c: Passed.
+time: 0.104 ms [1050 steps]
+
+[switch] switch.c: Passed.
+time: 0.043 ms [1042 steps]
+
+[to-lower-case] to-lower-case.c: Passed.
+time: 0.235 ms [6846 steps]
+
+[unalign] unalign.c: Passed.
+time: 0.019 ms [221 steps]
+
+[wanshu] wanshu.c: Passed.
+time: 0.200 ms [5334 steps]
+
+C Tests PASS
+35 / 35 passed
+Summary: 35 passed, 0 failed, 35 total
+Scored time: 35.176 ms
+Total time: 21198.350 ms
